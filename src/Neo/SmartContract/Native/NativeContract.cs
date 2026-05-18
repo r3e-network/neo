@@ -175,6 +175,11 @@ namespace Neo.SmartContract.Native
         /// </summary>
         public static NeoHubSequencerRegistryContract NeoHubSequencerRegistry { get; } = new();
 
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubForcedInclusionContract"/> class.
+        /// </summary>
+        public static NeoHubForcedInclusionContract NeoHubForcedInclusion { get; } = new();
+
         #endregion
 
         /// <summary>

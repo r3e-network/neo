@@ -41,7 +41,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubEmergencyManager,
             NativeContract.NeoHubGovernanceController,
             NativeContract.NeoHubSequencerBond,
-            NativeContract.NeoHubSequencerRegistry
+            NativeContract.NeoHubSequencerRegistry,
+            NativeContract.NeoHubForcedInclusion
         ];
 
         [TestInitialize]
@@ -1061,6 +1062,113 @@ namespace Neo.UnitTests.SmartContract.Native
                 AsUInt160(registry.Call(snapshot, "getSequencerAddress", Integer(chainId), PublicKey(sequencer.PublicKey))));
         }
 
+        [TestMethod]
+        public void ForcedInclusion_ConfiguresFeesAndEnqueuesBeforeStateChanges()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block(1000);
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0x91);
+            var settlementManager = H(0x92);
+            var feeRecipient = H(0x93);
+            var sender = H(0x94);
+            const uint chainId = 1021;
+            var gas = TransferTokenContract();
+            var tx = new byte[] { 0x01, 0x02, 0x03 };
+            var txHash = H256(0x95);
+            var forced = NeoHubForcedInclusion();
+
+            snapshot.AddContract(gas.Hash, gas);
+
+            forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(settlementManager));
+
+            Assert.AreEqual(owner, AsUInt160(forced.Call(snapshot, "getOwner")));
+            Assert.AreEqual(settlementManager, AsUInt160(forced.Call(snapshot, "getSettlementManager")));
+            Assert.AreEqual(7200, forced.Call(snapshot, "getDeadlineSeconds").GetInteger());
+            Assert.AreEqual(BigInteger.Zero, forced.Call(snapshot, "getFee").GetInteger());
+
+            Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+                forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                    "setDeadlineSeconds", Integer(59)));
+            forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setDeadlineSeconds", Integer(60));
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                    "setFee", Integer(10)));
+            forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setFeeRecipient", Hash160(feeRecipient));
+            forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setGasToken", Hash160(gas.Hash));
+            forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setFee", Integer(10));
+
+            Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+                CallAsScript(forced, snapshot, sender, block,
+                    "enqueueForcedTransaction", Integer(0), Bytes(tx), Hash256(txHash)));
+            Assert.AreEqual(0, forced.Call(snapshot, "getEntry", Integer(chainId), Integer(1)).GetSpan().Length);
+
+            var nonce = CallAsScript(forced, snapshot, sender, block,
+                "enqueueForcedTransaction", Integer(chainId), Bytes(tx), Hash256(txHash)).GetInteger();
+
+            Assert.AreEqual(1, nonce);
+            var entry = forced.Call(snapshot, "getEntry", Integer(chainId), Integer(1)).GetSpan().ToArray();
+            Assert.AreEqual(20 + 32 + 4 + tx.Length + 4, entry.Length);
+            Assert.AreEqual(sender, new UInt160(entry.AsSpan(0, UInt160.Length)));
+            Assert.AreEqual(txHash, new UInt256(entry.AsSpan(20, UInt256.Length)));
+            Assert.AreEqual((uint)tx.Length, ReadU32(entry.AsSpan(52)));
+            CollectionAssert.AreEqual(tx, entry.Skip(56).Take(tx.Length).ToArray());
+            Assert.AreEqual(61u, ReadU32(entry.AsSpan(56 + tx.Length)));
+
+            Assert.IsFalse(forced.Call(snapshot, "isConsumed", Integer(chainId), Integer(1)).GetBoolean());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(sender), block,
+                    "markConsumed", Integer(chainId), Integer(1)));
+            forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(settlementManager), block,
+                "markConsumed", Integer(chainId), Integer(1));
+            Assert.IsTrue(forced.Call(snapshot, "isConsumed", Integer(chainId), Integer(1)).GetBoolean());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(settlementManager), block,
+                    "markConsumed", Integer(chainId), Integer(1)));
+        }
+
+        [TestMethod]
+        public void ForcedInclusion_ReportsCensorshipAfterDeadlineOnce()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0x96);
+            var settlementManager = H(0x97);
+            var sender = H(0x98);
+            var sequencer = H(0x99);
+            const uint chainId = 1022;
+            var forced = NeoHubForcedInclusion();
+
+            forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), Block(1000),
+                "configure", Hash160(owner), Hash160(settlementManager));
+            forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                "setDeadlineSeconds", Integer(60));
+
+            CallAsScript(forced, snapshot, sender, Block(1000),
+                "enqueueForcedTransaction", Integer(chainId), Bytes([0x0a]), Hash256(H256(0x9a)));
+            CallAsScript(forced, snapshot, sender, Block(1000),
+                "enqueueForcedTransaction", Integer(chainId), Bytes([0x0b]), Hash256(H256(0x9b)));
+
+            Assert.IsFalse(forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(60000),
+                "reportCensorship", Integer(chainId), Integer(1), Hash160(sequencer)).GetBoolean());
+            Assert.IsTrue(forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(61000),
+                "reportCensorship", Integer(chainId), Integer(1), Hash160(sequencer)).GetBoolean());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(61000),
+                    "reportCensorship", Integer(chainId), Integer(1), Hash160(sequencer)));
+
+            forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(settlementManager), Block(1000),
+                "markConsumed", Integer(chainId), Integer(2));
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                forced.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(61000),
+                    "reportCensorship", Integer(chainId), Integer(2), Hash160(sequencer)));
+        }
+
         private static Block Block(ulong timestamp = 1000) => new()
         {
             Header = new Header
@@ -1102,6 +1210,8 @@ namespace Neo.UnitTests.SmartContract.Native
         private static NativeContract NeoHubSequencerBond() => NativeContract.NeoHubSequencerBond;
 
         private static NativeContract NeoHubSequencerRegistry() => NativeContract.NeoHubSequencerRegistry;
+
+        private static NativeContract NeoHubForcedInclusion() => NativeContract.NeoHubForcedInclusion;
 
         private static UInt160 AsUInt160(StackItem item) => new(item.GetSpan());
 
