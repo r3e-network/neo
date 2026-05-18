@@ -44,7 +44,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubSequencerRegistry,
             NativeContract.NeoHubForcedInclusion,
             NativeContract.NeoHubOptimisticChallenge,
-            NativeContract.NeoHubGovernanceFraudVerifier
+            NativeContract.NeoHubGovernanceFraudVerifier,
+            NativeContract.NeoHubRestrictedExecutionFraudVerifier
         ];
 
         [TestInitialize]
@@ -1388,6 +1389,113 @@ namespace Neo.UnitTests.SmartContract.Native
             }
         }
 
+        [TestMethod]
+        public void RestrictedExecutionFraudVerifier_VerifiesV3StorageProofPayload()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var verifier = NeoHubRestrictedExecutionFraudVerifier();
+            var keyA = new byte[] { 0xaa };
+            var preValueA = new byte[] { 0x00 };
+            var postValueA = new byte[] { 0x11 };
+            var keyB = new byte[] { 0xbb };
+            var valueB = new byte[] { 0x22 };
+            var preLeafA = RestrictedHashEntry(keyA, preValueA);
+            var postLeafA = RestrictedHashEntry(keyA, postValueA);
+            var leafB = RestrictedHashEntry(keyB, valueB);
+            var preRoot = HashPair(preLeafA, leafB);
+            var postRoot = HashPair(postLeafA, leafB);
+            var claimedRoot = H256(0xde);
+            const uint chainId = 1027;
+            const ulong batchNumber = 11;
+
+            Assert.AreEqual(101, NeoHubRestrictedExecutionFraudVerifierContract.V1HeaderSize);
+            Assert.AreEqual(105, NeoHubRestrictedExecutionFraudVerifierContract.V2HeaderSize);
+            Assert.AreEqual(3, NeoHubRestrictedExecutionFraudVerifierContract.SupportedVersion3);
+            Assert.AreEqual(64 * 1024, NeoHubRestrictedExecutionFraudVerifierContract.MaxDisputedTxBytes);
+            Assert.AreEqual(32, NeoHubRestrictedExecutionFraudVerifierContract.MaxStorageProofsPerPayload);
+            Assert.AreEqual(256, NeoHubRestrictedExecutionFraudVerifierContract.MaxKeyBytes);
+            Assert.AreEqual(4096, NeoHubRestrictedExecutionFraudVerifierContract.MaxValueBytes);
+            Assert.AreEqual(64, NeoHubRestrictedExecutionFraudVerifierContract.MaxSiblingDepth);
+
+            var methods = verifier.GetContractState(TestProtocolSettings.Default, 0).Manifest.Abi.Methods;
+            Assert.IsTrue(methods.Single(m => m.Name == "verifyFraud").Safe);
+
+            var acceptedEvents = new System.Collections.Generic.List<NotifyEventArgs>();
+            var payload = RestrictedFraudPayload(preRoot, claimedRoot, postRoot, [0x42, 0x43],
+                keyA, preValueA, postValueA, 0, [leafB], [leafB]);
+            Assert.IsTrue(verifier.Call(snapshot, "verifyFraud", (_, e) => acceptedEvents.Add(e),
+                Integer(chainId), Integer(batchNumber), Bytes(payload)).GetBoolean());
+            Assert.HasCount(1, acceptedEvents);
+            Assert.AreEqual("FraudProofAccepted", acceptedEvents[0].EventName);
+            Assert.AreEqual(chainId, (uint)acceptedEvents[0].State[0].GetInteger());
+            Assert.AreEqual(batchNumber, (ulong)acceptedEvents[0].State[1].GetInteger());
+            Assert.AreEqual(claimedRoot, AsUInt256(acceptedEvents[0].State[2]));
+            Assert.AreEqual(postRoot, AsUInt256(acceptedEvents[0].State[3]));
+        }
+
+        [TestMethod]
+        public void RestrictedExecutionFraudVerifier_RejectsMalformedPayloadsWithReasons()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var verifier = NeoHubRestrictedExecutionFraudVerifier();
+            var key = new byte[] { 0x31 };
+            var preValue = new byte[] { 0x01 };
+            var postValue = new byte[] { 0x02 };
+            var preRoot = RestrictedHashEntry(key, preValue);
+            var postRoot = RestrictedHashEntry(key, postValue);
+            var claimedRoot = H256(0xdf);
+            var valid = RestrictedFraudPayload(preRoot, claimedRoot, postRoot, [],
+                key, preValue, postValue, 0, [], []);
+            const uint chainId = 1028;
+            const ulong batchNumber = 12;
+
+            AssertRejected([], NeoHubRestrictedExecutionFraudVerifierContract.ReasonBadLength);
+
+            var badVersion = (byte[])valid.Clone();
+            badVersion[0] = 2;
+            AssertRejected(badVersion, NeoHubRestrictedExecutionFraudVerifierContract.ReasonBadVersion);
+            AssertRejected(valid.Take(104).ToArray(), NeoHubRestrictedExecutionFraudVerifierContract.ReasonBadLength);
+
+            var oversizedWitness = new byte[NeoHubRestrictedExecutionFraudVerifierContract.V2HeaderSize];
+            oversizedWitness[0] = NeoHubRestrictedExecutionFraudVerifierContract.SupportedVersion3;
+            WriteU32(oversizedWitness, 101, NeoHubRestrictedExecutionFraudVerifierContract.MaxDisputedTxBytes + 1U);
+            AssertRejected(oversizedWitness, NeoHubRestrictedExecutionFraudVerifierContract.ReasonOversizedWitness);
+
+            var zeroProofs = (byte[])valid.Clone();
+            WriteU32(zeroProofs, NeoHubRestrictedExecutionFraudVerifierContract.V2HeaderSize, 0);
+            AssertRejected(zeroProofs, NeoHubRestrictedExecutionFraudVerifierContract.ReasonProofCountInvalid);
+
+            AssertRejected(RestrictedFraudPayload(preRoot, postRoot, postRoot, [],
+                key, preValue, postValue, 0, [], []), NeoHubRestrictedExecutionFraudVerifierContract.ReasonNoDiscrepancy);
+
+            var largeKey = Enumerable.Repeat((byte)0x55, NeoHubRestrictedExecutionFraudVerifierContract.MaxKeyBytes + 1).ToArray();
+            AssertRejected(RestrictedFraudPayload(RestrictedHashEntry(largeKey, preValue), H256(0xe1),
+                RestrictedHashEntry(largeKey, postValue), [], largeKey, preValue, postValue, 0, [], []),
+                NeoHubRestrictedExecutionFraudVerifierContract.ReasonInvalidStorageProof);
+
+            var badPreRoot = (byte[])valid.Clone();
+            badPreRoot[1] ^= 0xff;
+            AssertRejected(badPreRoot, NeoHubRestrictedExecutionFraudVerifierContract.ReasonPreStateRootMismatch);
+
+            var badPostRoot = (byte[])valid.Clone();
+            badPostRoot[65] ^= 0xff;
+            AssertRejected(badPostRoot, NeoHubRestrictedExecutionFraudVerifierContract.ReasonReplayedPostStateRootMismatch);
+
+            AssertRejected(AppendByte(valid, 0xff), NeoHubRestrictedExecutionFraudVerifierContract.ReasonBadLength);
+
+            void AssertRejected(byte[] payload, byte reason)
+            {
+                var rejectedEvents = new System.Collections.Generic.List<NotifyEventArgs>();
+                Assert.IsFalse(verifier.Call(snapshot, "verifyFraud", (_, e) => rejectedEvents.Add(e),
+                    Integer(chainId), Integer(batchNumber), Bytes(payload)).GetBoolean());
+                Assert.HasCount(1, rejectedEvents);
+                Assert.AreEqual("FraudProofRejected", rejectedEvents[0].EventName);
+                Assert.AreEqual(chainId, (uint)rejectedEvents[0].State[0].GetInteger());
+                Assert.AreEqual(batchNumber, (ulong)rejectedEvents[0].State[1].GetInteger());
+                Assert.AreEqual(reason, (byte)rejectedEvents[0].State[2].GetInteger());
+            }
+        }
+
         private static Block Block(ulong timestamp = 1000) => new()
         {
             Header = new Header
@@ -1435,6 +1543,8 @@ namespace Neo.UnitTests.SmartContract.Native
         private static NativeContract NeoHubOptimisticChallenge() => NativeContract.NeoHubOptimisticChallenge;
 
         private static NativeContract NeoHubGovernanceFraudVerifier() => NativeContract.NeoHubGovernanceFraudVerifier;
+
+        private static NativeContract NeoHubRestrictedExecutionFraudVerifier() => NativeContract.NeoHubRestrictedExecutionFraudVerifier;
 
         private static UInt160 AsUInt160(StackItem item) => new(item.GetSpan());
 
@@ -1699,6 +1809,86 @@ namespace Neo.UnitTests.SmartContract.Native
             return bytes;
         }
 
+        private static byte[] RestrictedFraudPayload(
+            UInt256 preRoot,
+            UInt256 claimedRoot,
+            UInt256 replayedRoot,
+            byte[] disputedTxBytes,
+            byte[] key,
+            byte[] preValue,
+            byte[] postValue,
+            ulong leafIndex,
+            UInt256[] preSiblings,
+            UInt256[] postSiblings)
+        {
+            var proofLength = 2 + key.Length + 4 + preValue.Length + 4 + postValue.Length + 8
+                + 1 + UInt256.Length * preSiblings.Length
+                + 1 + UInt256.Length * postSiblings.Length;
+            var bytes = new byte[NeoHubRestrictedExecutionFraudVerifierContract.V2HeaderSize
+                + disputedTxBytes.Length + 4 + proofLength];
+            var offset = 0;
+            bytes[offset++] = NeoHubRestrictedExecutionFraudVerifierContract.SupportedVersion3;
+            preRoot.ToArray().CopyTo(bytes, offset);
+            offset += UInt256.Length;
+            claimedRoot.ToArray().CopyTo(bytes, offset);
+            offset += UInt256.Length;
+            replayedRoot.ToArray().CopyTo(bytes, offset);
+            offset += UInt256.Length;
+            WriteU32(bytes, offset, 0);
+            offset += 4;
+            WriteU32(bytes, offset, (uint)disputedTxBytes.Length);
+            offset += 4;
+            disputedTxBytes.CopyTo(bytes, offset);
+            offset += disputedTxBytes.Length;
+            WriteU32(bytes, offset, 1);
+            offset += 4;
+            WriteU16(bytes, offset, (ushort)key.Length);
+            offset += 2;
+            key.CopyTo(bytes, offset);
+            offset += key.Length;
+            WriteU32(bytes, offset, (uint)preValue.Length);
+            offset += 4;
+            preValue.CopyTo(bytes, offset);
+            offset += preValue.Length;
+            WriteU32(bytes, offset, (uint)postValue.Length);
+            offset += 4;
+            postValue.CopyTo(bytes, offset);
+            offset += postValue.Length;
+            WriteU64(bytes, offset, leafIndex);
+            offset += 8;
+            bytes[offset++] = (byte)preSiblings.Length;
+            foreach (var sibling in preSiblings)
+            {
+                sibling.ToArray().CopyTo(bytes, offset);
+                offset += UInt256.Length;
+            }
+            bytes[offset++] = (byte)postSiblings.Length;
+            foreach (var sibling in postSiblings)
+            {
+                sibling.ToArray().CopyTo(bytes, offset);
+                offset += UInt256.Length;
+            }
+            return bytes;
+        }
+
+        private static UInt256 RestrictedHashEntry(byte[] key, byte[] value)
+        {
+            var bytes = new byte[4 + key.Length + 4 + value.Length];
+            WriteU32(bytes, 0, (uint)key.Length);
+            key.CopyTo(bytes, 4);
+            WriteU32(bytes, 4 + key.Length, (uint)value.Length);
+            value.CopyTo(bytes, 8 + key.Length);
+            return new UInt256(Crypto.Hash256(bytes));
+        }
+
+        private static byte[] AppendByte(byte[] source, byte value)
+        {
+            var bytes = new byte[source.Length + 1];
+            source.CopyTo(bytes, 0);
+            bytes[^1] = value;
+            return bytes;
+        }
+
         private static StorageKey SettlementKey(byte prefix, uint chainId, ulong batchNumber)
         {
             var key = new byte[12];
@@ -1775,6 +1965,12 @@ namespace Neo.UnitTests.SmartContract.Native
                 | ((ulong)bytes[5] << 40)
                 | ((ulong)bytes[6] << 48)
                 | ((ulong)bytes[7] << 56);
+        }
+
+        private static void WriteU16(byte[] bytes, int offset, ushort value)
+        {
+            bytes[offset] = (byte)value;
+            bytes[offset + 1] = (byte)(value >> 8);
         }
 
         private static void WriteU32(byte[] bytes, int offset, uint value)

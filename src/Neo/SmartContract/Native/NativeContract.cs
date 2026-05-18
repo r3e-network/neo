@@ -190,6 +190,11 @@ namespace Neo.SmartContract.Native
         /// </summary>
         public static NeoHubGovernanceFraudVerifierContract NeoHubGovernanceFraudVerifier { get; } = new();
 
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubRestrictedExecutionFraudVerifierContract"/> class.
+        /// </summary>
+        public static NeoHubRestrictedExecutionFraudVerifierContract NeoHubRestrictedExecutionFraudVerifier { get; } = new();
+
         #endregion
 
         /// <summary>
