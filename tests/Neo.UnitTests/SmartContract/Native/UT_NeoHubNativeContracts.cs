@@ -40,7 +40,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubSharedBridge,
             NativeContract.NeoHubEmergencyManager,
             NativeContract.NeoHubGovernanceController,
-            NativeContract.NeoHubSequencerBond
+            NativeContract.NeoHubSequencerBond,
+            NativeContract.NeoHubSequencerRegistry
         ];
 
         [TestInitialize]
@@ -944,6 +945,122 @@ namespace Neo.UnitTests.SmartContract.Native
                     "withdraw", Integer(chainId), Hash160(sequencer), Integer(1_000_000)));
         }
 
+        [TestMethod]
+        public void SequencerRegistry_ConfiguresPolicyAndRequiresBondedSequencer()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xe1);
+            var slasher = H(0xe2);
+            var sponsor = H(0xe3);
+            var sequencerAddress = H(0xe4);
+            var secondSequencerAddress = H(0xe5);
+            var sequencer = Key(0x61);
+            var secondSequencer = Key(0x62);
+            var sequencerAccount = Contract.CreateSignatureRedeemScript(sequencer.PublicKey).ToScriptHash();
+            var secondSequencerAccount = Contract.CreateSignatureRedeemScript(secondSequencer.PublicKey).ToScriptHash();
+            const uint chainId = 1019;
+            var token = TransferTokenContract();
+            var bond = NeoHubSequencerBond();
+            var registry = NeoHubSequencerRegistry();
+
+            snapshot.AddContract(token.Hash, token);
+
+            bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(token.Hash), ArrayParam(Hash160(slasher)));
+            registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(bond.Hash));
+
+            Assert.AreEqual(owner, AsUInt160(registry.Call(snapshot, "getOwner")));
+            Assert.AreEqual(21, registry.Call(snapshot, "getMaxCommitteeSize").GetInteger());
+            Assert.AreEqual(86400, registry.Call(snapshot, "getExitWindowSeconds").GetInteger());
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(sequencerAccount), block,
+                    "register", Integer(chainId), PublicKey(sequencer.PublicKey), Hash160(sequencerAddress)));
+
+            CallAsScript(bond, snapshot, sponsor, block,
+                "deposit", Integer(chainId), Hash160(sequencerAddress), Integer(NeoHubSequencerBondContract.DefaultMinBond));
+            registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(sequencerAccount), block,
+                "register", Integer(chainId), PublicKey(sequencer.PublicKey), Hash160(sequencerAddress));
+
+            Assert.IsTrue(registry.Call(snapshot, "isRegistered", Integer(chainId), PublicKey(sequencer.PublicKey)).GetBoolean());
+            Assert.AreEqual(1, registry.Call(snapshot, "getActiveCount", Integer(chainId)).GetInteger());
+            Assert.AreEqual(1,
+                registry.Call(snapshot, "getStatus", Integer(chainId), PublicKey(sequencer.PublicKey)).GetInteger());
+            Assert.AreEqual(sequencerAddress,
+                AsUInt160(registry.Call(snapshot, "getSequencerAddress", Integer(chainId), PublicKey(sequencer.PublicKey))));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(sequencerAccount), block,
+                    "register", Integer(chainId), PublicKey(sequencer.PublicKey), Hash160(sequencerAddress)));
+
+            registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setMaxCommitteeSize", Integer(1));
+            CallAsScript(bond, snapshot, sponsor, block,
+                "deposit", Integer(chainId), Hash160(secondSequencerAddress), Integer(NeoHubSequencerBondContract.DefaultMinBond));
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(secondSequencerAccount), block,
+                    "register", Integer(chainId), PublicKey(secondSequencer.PublicKey), Hash160(secondSequencerAddress)));
+        }
+
+        [TestMethod]
+        public void SequencerRegistry_ExitWindowKeepsSequencerUntilFinalized()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xf1);
+            var slasher = H(0xf2);
+            var sponsor = H(0xf3);
+            var sequencerAddress = H(0xf4);
+            var sequencer = Key(0x71);
+            var sequencerAccount = Contract.CreateSignatureRedeemScript(sequencer.PublicKey).ToScriptHash();
+            const uint chainId = 1020;
+            var token = TransferTokenContract();
+            var bond = NeoHubSequencerBond();
+            var registry = NeoHubSequencerRegistry();
+
+            snapshot.AddContract(token.Hash, token);
+
+            bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), Block(1000),
+                "configure", Hash160(owner), Hash160(token.Hash), ArrayParam(Hash160(slasher)));
+            registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), Block(1000),
+                "configure", Hash160(owner), Hash160(bond.Hash));
+            registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                "setExitWindowSeconds", Integer(60));
+            CallAsScript(bond, snapshot, sponsor, Block(1000),
+                "deposit", Integer(chainId), Hash160(sequencerAddress), Integer(NeoHubSequencerBondContract.DefaultMinBond));
+            registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(sequencerAccount), Block(1000),
+                "register", Integer(chainId), PublicKey(sequencer.PublicKey), Hash160(sequencerAddress));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(H(0xf5)), Block(1000),
+                    "unregister", Integer(chainId), PublicKey(sequencer.PublicKey)));
+
+            var exitsAt = registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(sequencerAccount), Block(1000),
+                "unregister", Integer(chainId), PublicKey(sequencer.PublicKey)).GetInteger();
+
+            Assert.AreEqual(61, exitsAt);
+            Assert.IsTrue(registry.Call(snapshot, "isRegistered", Integer(chainId), PublicKey(sequencer.PublicKey)).GetBoolean());
+            Assert.AreEqual(1, registry.Call(snapshot, "getActiveCount", Integer(chainId)).GetInteger());
+            Assert.AreEqual(2,
+                registry.Call(snapshot, "getStatus", Integer(chainId), PublicKey(sequencer.PublicKey)).GetInteger());
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(60000),
+                    "finalize", Integer(chainId), PublicKey(sequencer.PublicKey)));
+
+            registry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(61000),
+                "finalize", Integer(chainId), PublicKey(sequencer.PublicKey));
+
+            Assert.IsFalse(registry.Call(snapshot, "isRegistered", Integer(chainId), PublicKey(sequencer.PublicKey)).GetBoolean());
+            Assert.AreEqual(0, registry.Call(snapshot, "getActiveCount", Integer(chainId)).GetInteger());
+            Assert.AreEqual(0, registry.Call(snapshot, "getStatus", Integer(chainId), PublicKey(sequencer.PublicKey)).GetInteger());
+            Assert.AreEqual(UInt160.Zero,
+                AsUInt160(registry.Call(snapshot, "getSequencerAddress", Integer(chainId), PublicKey(sequencer.PublicKey))));
+        }
+
         private static Block Block(ulong timestamp = 1000) => new()
         {
             Header = new Header
@@ -983,6 +1100,8 @@ namespace Neo.UnitTests.SmartContract.Native
             new(ContractParameterType.Array) { Value = value.ToList() };
 
         private static NativeContract NeoHubSequencerBond() => NativeContract.NeoHubSequencerBond;
+
+        private static NativeContract NeoHubSequencerRegistry() => NativeContract.NeoHubSequencerRegistry;
 
         private static UInt160 AsUInt160(StackItem item) => new(item.GetSpan());
 
