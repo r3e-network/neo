@@ -130,6 +130,16 @@ namespace Neo.SmartContract.Native
         /// </summary>
         public static NeoHubL1TxFilterContract NeoHubL1TxFilter { get; } = new();
 
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubVerifierRegistryContract"/> class.
+        /// </summary>
+        public static NeoHubVerifierRegistryContract NeoHubVerifierRegistry { get; } = new();
+
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubMessageRouterContract"/> class.
+        /// </summary>
+        public static NeoHubMessageRouterContract NeoHubMessageRouter { get; } = new();
+
         #endregion
 
         /// <summary>

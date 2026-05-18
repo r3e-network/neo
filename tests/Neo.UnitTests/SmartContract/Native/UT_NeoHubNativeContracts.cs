@@ -10,6 +10,7 @@ using Neo.Persistence;
 using Neo.SmartContract;
 using Neo.SmartContract.Native;
 using Neo.UnitTests.Extensions;
+using Neo.VM;
 using Neo.VM.Types;
 using System;
 using System.Linq;
@@ -26,7 +27,9 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubChainRegistry,
             NativeContract.NeoHubTokenRegistry,
             NativeContract.NeoHubDARegistry,
-            NativeContract.NeoHubL1TxFilter
+            NativeContract.NeoHubL1TxFilter,
+            NativeContract.NeoHubVerifierRegistry,
+            NativeContract.NeoHubMessageRouter
         ];
 
         [TestInitialize]
@@ -166,6 +169,69 @@ namespace Neo.UnitTests.SmartContract.Native
                 "acceptL1ToL2", Integer(1004), Hash160(sender), Hash160(receiver), Integer(9), Bytes([1, 2, 3])).GetBoolean());
         }
 
+        [TestMethod]
+        public void VerifierRegistry_ConfiguresOwnerAndStoresVerifier()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0x61);
+            var verifier = H(0x62);
+
+            NativeContract.NeoHubVerifierRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubVerifierRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), block,
+                    "registerVerifier", Integer(1), Hash160(verifier)));
+
+            NativeContract.NeoHubVerifierRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerVerifier", Integer(1), Hash160(verifier));
+
+            Assert.AreEqual(owner, AsUInt160(NativeContract.NeoHubVerifierRegistry.Call(snapshot, "getOwner")));
+            Assert.AreEqual(verifier, AsUInt160(NativeContract.NeoHubVerifierRegistry.Call(snapshot,
+                "getVerifier", Integer(1))));
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubVerifierRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                    "registerVerifier", Integer(0), Hash160(verifier)));
+        }
+
+        [TestMethod]
+        public void MessageRouter_EnqueuesMessagesAndAppliesL1TxFilter()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0x71);
+            var settlementManager = H(0x72);
+            var sender = H(0x73);
+            var receiver = H(0x74);
+
+            NativeContract.NeoHubL1TxFilter.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner));
+            NativeContract.NeoHubL1TxFilter.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setAllowedSender", Hash160(sender), Boolean(false));
+            NativeContract.NeoHubMessageRouter.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(settlementManager));
+            NativeContract.NeoHubMessageRouter.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setL1TxFilter", Integer(1005), Hash160(NativeContract.NeoHubL1TxFilter.Hash));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                CallAsScript(NativeContract.NeoHubMessageRouter, snapshot, sender, block,
+                    "enqueueL1ToL2", Integer(1005), Hash160(receiver), Integer(9), Bytes([1, 2, 3])));
+
+            NativeContract.NeoHubL1TxFilter.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setAllowedSender", Hash160(sender), Boolean(true));
+            var nonce = CallAsScript(NativeContract.NeoHubMessageRouter, snapshot, sender, block,
+                "enqueueL1ToL2", Integer(1005), Hash160(receiver), Integer(9), Bytes([1, 2, 3])).GetInteger();
+
+            Assert.AreEqual(1, nonce);
+            Assert.IsTrue(NativeContract.NeoHubMessageRouter.Call(snapshot,
+                "getL1ToL2", Integer(1005), Integer(1)).GetSpan().Length > 0);
+            Assert.AreEqual(NativeContract.NeoHubL1TxFilter.Hash, AsUInt160(NativeContract.NeoHubMessageRouter.Call(snapshot,
+                "getL1TxFilter", Integer(1005))));
+        }
+
         private static Block Block() => new()
         {
             Header = new Header
@@ -199,6 +265,31 @@ namespace Neo.UnitTests.SmartContract.Native
         private static UInt160 AsUInt160(StackItem item) => new(item.GetSpan());
 
         private static UInt256 AsUInt256(StackItem item) => new(item.GetSpan());
+
+        private static StackItem CallAsScript(
+            NativeContract contract,
+            DataCache snapshot,
+            UInt160 callingScriptHash,
+            Block block,
+            string method,
+            params ContractParameter[] args)
+        {
+            using var engine = ApplicationEngine.Create(TriggerType.Application,
+                new Nep17NativeContractExtensions.ManualWitness(callingScriptHash), snapshot, block,
+                settings: TestProtocolSettings.Default);
+            using var script = new ScriptBuilder();
+            script.EmitDynamicCall(contract.Hash, method, args);
+            engine.LoadScript(script.ToArray(), configureState: state =>
+            {
+                state.NativeCallingScriptHash = callingScriptHash;
+                state.ScriptHash = callingScriptHash;
+            });
+
+            if (engine.Execute() != VM.VMState.HALT)
+                throw engine.FaultException;
+
+            return engine.ResultStack.Count > 0 ? engine.ResultStack.Pop() : StackItem.Null;
+        }
 
         private static byte[] ChainConfig(
             uint chainId,
