@@ -364,7 +364,7 @@ public sealed class L2BridgeContract : L2NativeContract
         engine.SnapshotCache.Add(dedupe, new StorageItem(new byte[] { 1 }));
         var l2Asset = GetL2Asset(engine.SnapshotCache, l1Asset);
         RequireNonZero(l2Asset, nameof(l2Asset));
-        await engine.CallFromNativeContractAsync(Hash, l2Asset, "mint", recipient, amount);
+        await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "mint", l2Asset, recipient, amount);
         Notify(engine, "Mint", l1Asset, recipient, amount, sourceChainId, nonce);
     }
 
@@ -376,7 +376,7 @@ public sealed class L2BridgeContract : L2NativeContract
         RequireNonZero(l1Recipient, nameof(l1Recipient));
         var caller = CallingScriptHash(engine);
         var nonce = NextNonce(engine.SnapshotCache, caller);
-        await engine.CallFromNativeContractAsync(Hash, l2Asset, "burn", caller, amount);
+        await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "burn", l2Asset, caller, amount);
         Notify(engine, "WithdrawalEmitted", caller, l1Recipient, l2Asset, amount, nonce);
         return nonce;
     }
@@ -449,13 +449,17 @@ public sealed class L2FeeContract : L2NativeContract
         var proverShare = amount * bps[1] / BasisPointsTotal;
         var daShare = amount - sequencerShare - proverShare;
         var asset = ReadUInt160(engine.SnapshotCache, KeyFeeAsset);
-        if (sequencerShare > 0)
-            await engine.CallFromNativeContractAsync<bool>(Hash, asset, "transfer", Hash, ReadUInt160(engine.SnapshotCache, KeySequencerAddress), sequencerShare, StackItem.Null);
-        if (proverShare > 0)
-            await engine.CallFromNativeContractAsync<bool>(Hash, asset, "transfer", Hash, ReadUInt160(engine.SnapshotCache, KeyProverAddress), proverShare, StackItem.Null);
-        if (daShare > 0)
-            await engine.CallFromNativeContractAsync<bool>(Hash, asset, "transfer", Hash, ReadUInt160(engine.SnapshotCache, KeyDAAddress), daShare, StackItem.Null);
+        await TransferFeeShare(engine, asset, ReadUInt160(engine.SnapshotCache, KeySequencerAddress), sequencerShare);
+        await TransferFeeShare(engine, asset, ReadUInt160(engine.SnapshotCache, KeyProverAddress), proverShare);
+        await TransferFeeShare(engine, asset, ReadUInt160(engine.SnapshotCache, KeyDAAddress), daShare);
         Notify(engine, "FeesDistributed", amount, sequencerShare, proverShare, daShare);
+    }
+
+    private async ContractTask TransferFeeShare(ApplicationEngine engine, UInt160 asset, UInt160 recipient, BigInteger amount)
+    {
+        if (amount <= 0) return;
+        if (!await engine.CallFromNativeContractAsync<bool>(Hash, asset, "transfer", Hash, recipient, amount, StackItem.Null))
+            throw new InvalidOperationException("fee transfer failed");
     }
 
     private void SetBpsInternal(DataCache snapshot, uint sequencerBps, uint proverBps, uint daBps)
@@ -542,6 +546,7 @@ public sealed class L2NativeExternalBridgeContract : L2NativeContract
     private const byte PrefixOutboundNonce = 0x01;
     private const byte PrefixConsumedInboundNonce = 0x02;
     private const byte PrefixAssetMapping = 0x03;
+    private const byte PrefixReverseAssetMapping = 0x04;
     private const byte KeySystemAccount = 0xfe;
     private const byte KeyOwner = 0xff;
 
@@ -569,11 +574,21 @@ public sealed class L2NativeExternalBridgeContract : L2NativeContract
         AssertOwnerOrCommittee(engine, KeyOwner);
         if (!IsForeignChainId(externalChainId)) throw new ArgumentOutOfRangeException(nameof(externalChainId), "externalChainId must use 0xE0 namespace.");
         RequireNonZero(l2Asset, nameof(l2Asset));
+        var reverseKey = Key(PrefixReverseAssetMapping, externalChainId, l2Asset);
+        if (engine.SnapshotCache.Contains(reverseKey))
+        {
+            var existingForeignAsset = ReadUInt160(engine.SnapshotCache, reverseKey);
+            if (existingForeignAsset != foreignAsset) throw new InvalidOperationException("L2 asset already mapped to another foreign asset");
+        }
         engine.SnapshotCache.GetAndChange(Key(PrefixAssetMapping, externalChainId, foreignAsset), () => new StorageItem(l2Asset.ToArray())).Value = l2Asset.ToArray();
+        engine.SnapshotCache.GetAndChange(reverseKey, () => new StorageItem(foreignAsset.ToArray())).Value = foreignAsset.ToArray();
     }
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
     public UInt160 GetAssetMapping(IReadOnlyStore snapshot, uint externalChainId, UInt160 foreignAsset) => ReadUInt160(snapshot, Key(PrefixAssetMapping, externalChainId, foreignAsset));
+
+    [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
+    public bool IsL2AssetRegistered(IReadOnlyStore snapshot, uint externalChainId, UInt160 l2Asset) => snapshot.Contains(Key(PrefixReverseAssetMapping, externalChainId, l2Asset));
 
     [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States | CallFlags.AllowNotify)]
     private async ContractTask<ulong> Send(ApplicationEngine engine, uint externalChainId, UInt160 recipient, UInt160 l2Asset, BigInteger amount, byte[] calldata, ulong deadlineUnixSeconds)
@@ -582,9 +597,9 @@ public sealed class L2NativeExternalBridgeContract : L2NativeContract
         RequireNonZero(recipient, nameof(recipient));
         RequireNonZero(l2Asset, nameof(l2Asset));
         RequirePositive(amount, nameof(amount));
+        if (!IsL2AssetRegistered(engine.SnapshotCache, externalChainId, l2Asset)) throw new InvalidOperationException("asset not registered for external chain");
         var sender = CallingScriptHash(engine);
-        if (!await engine.CallFromNativeContractAsync<bool>(Hash, l2Asset, "transfer", sender, UInt160.Zero, amount, StackItem.Null))
-            throw new InvalidOperationException("L2 asset transfer failed");
+        await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "burn", l2Asset, sender, amount);
         var nonceKey = CreateStorageKey(PrefixOutboundNonce, U32Le(externalChainId));
         var next = (ulong)ReadInteger(engine.SnapshotCache, nonceKey) + 1;
         engine.SnapshotCache.GetAndChange(nonceKey, () => new StorageItem(BigInteger.Zero)).Set(next);
@@ -599,10 +614,10 @@ public sealed class L2NativeExternalBridgeContract : L2NativeContract
         RequirePositive(amount, nameof(amount));
         RequireNonZero(l2Recipient, nameof(l2Recipient));
         RequireNonZero(l2Asset, nameof(l2Asset));
+        if (!IsL2AssetRegistered(engine.SnapshotCache, externalChainId, l2Asset)) throw new InvalidOperationException("asset not registered for external chain");
         var consumed = Key(PrefixConsumedInboundNonce, externalChainId, nonce);
         if (engine.SnapshotCache.Contains(consumed)) throw new InvalidOperationException("inbound nonce already consumed");
-        if (!await engine.CallFromNativeContractAsync<bool>(Hash, l2Asset, "transfer", Hash, l2Recipient, amount, StackItem.Null))
-            throw new InvalidOperationException("L2 asset transfer failed");
+        await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "mint", l2Asset, l2Recipient, amount);
         engine.SnapshotCache.Add(consumed, new StorageItem(new byte[] { 1 }));
         Notify(engine, "ExternalInboundApplied", externalChainId, nonce, foreignSender, l2Recipient, amount);
     }
@@ -726,6 +741,7 @@ public sealed class BridgedNep17Contract : L2NativeContract
 {
     private const byte PrefixL1ToL2 = 0x01;
     private const byte PrefixL2ToL1 = 0x02;
+    private const byte PrefixAuthorizedBridge = 0x03;
     private const byte KeyBridge = 0xfe;
     private const byte KeyOwner = 0xff;
 
@@ -743,7 +759,7 @@ public sealed class BridgedNep17Contract : L2NativeContract
         RequireNonZero(owner, nameof(owner));
         RequireNonZero(bridge, nameof(bridge));
         WriteUInt160(engine.SnapshotCache, KeyOwner, owner);
-        WriteUInt160(engine.SnapshotCache, KeyBridge, bridge);
+        SetBridgeInternal(engine.SnapshotCache, bridge);
     }
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
@@ -757,7 +773,25 @@ public sealed class BridgedNep17Contract : L2NativeContract
     {
         AssertOwnerOrCommittee(engine, KeyOwner);
         RequireNonZero(bridge, nameof(bridge));
-        WriteUInt160(engine.SnapshotCache, KeyBridge, bridge);
+        SetBridgeInternal(engine.SnapshotCache, bridge);
+    }
+
+    [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States)]
+    private void AuthorizeBridge(ApplicationEngine engine, UInt160 bridge, bool allowed)
+    {
+        AssertOwnerOrCommittee(engine, KeyOwner);
+        RequireNonZero(bridge, nameof(bridge));
+        var key = Key(PrefixAuthorizedBridge, bridge);
+        if (allowed)
+            engine.SnapshotCache.GetAndChange(key, () => new StorageItem(new byte[] { 1 })).Value = new byte[] { 1 };
+        else
+            engine.SnapshotCache.Delete(key);
+    }
+
+    [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
+    public bool IsAuthorizedBridge(IReadOnlyStore snapshot, UInt160 bridge)
+    {
+        return bridge != UInt160.Zero && snapshot.Contains(Key(PrefixAuthorizedBridge, bridge));
     }
 
     [ContractMethod(CpuFee = 1 << 17, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States | CallFlags.AllowNotify)]
@@ -813,7 +847,15 @@ public sealed class BridgedNep17Contract : L2NativeContract
     private void AssertBridge(ApplicationEngine engine)
     {
         var bridge = GetBridge(engine.SnapshotCache);
-        if (CallingScriptHash(engine) != bridge && !engine.CheckWitnessInternal(bridge)) throw new InvalidOperationException("not bridge");
+        if (bridge == UInt160.Zero) throw new InvalidOperationException("bridge unset");
+        var caller = CallingScriptHash(engine);
+        if (caller != bridge && !IsAuthorizedBridge(engine.SnapshotCache, caller) && !engine.CheckWitnessInternal(bridge)) throw new InvalidOperationException("not bridge");
+    }
+
+    private void SetBridgeInternal(DataCache snapshot, UInt160 bridge)
+    {
+        WriteUInt160(snapshot, KeyBridge, bridge);
+        snapshot.GetAndChange(Key(PrefixAuthorizedBridge, bridge), () => new StorageItem(new byte[] { 1 })).Value = new byte[] { 1 };
     }
 }
 
