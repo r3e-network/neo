@@ -43,7 +43,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubSequencerBond,
             NativeContract.NeoHubSequencerRegistry,
             NativeContract.NeoHubForcedInclusion,
-            NativeContract.NeoHubOptimisticChallenge
+            NativeContract.NeoHubOptimisticChallenge,
+            NativeContract.NeoHubGovernanceFraudVerifier
         ];
 
         [TestInitialize]
@@ -1313,6 +1314,80 @@ namespace Neo.UnitTests.SmartContract.Native
                     "finalizeIfPastWindow", Integer(chainId), Integer(batchNumber)));
         }
 
+        [TestMethod]
+        public void GovernanceFraudVerifier_VerifiesV1AndV2StructuralPayloads()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var verifier = NeoHubGovernanceFraudVerifier();
+            var claimed = H256(0xc1);
+            var replayed = H256(0xc2);
+            const uint chainId = 1025;
+            const ulong batchNumber = 9;
+
+            Assert.AreEqual(101, NeoHubGovernanceFraudVerifierContract.FraudProofPayloadSize);
+            Assert.AreEqual(105, NeoHubGovernanceFraudVerifierContract.V2HeaderSize);
+            Assert.AreEqual(64 * 1024, NeoHubGovernanceFraudVerifierContract.MaxDisputedTxBytes);
+
+            var methods = verifier.GetContractState(TestProtocolSettings.Default, 0).Manifest.Abi.Methods;
+            Assert.IsTrue(methods.Single(m => m.Name == "verifyFraud").Safe);
+
+            var acceptedEvents = new System.Collections.Generic.List<NotifyEventArgs>();
+            Assert.IsTrue(verifier.Call(snapshot, "verifyFraud", (_, e) => acceptedEvents.Add(e),
+                Integer(chainId), Integer(batchNumber), Bytes(GovernanceFraudPayload(1, claimed, replayed))).GetBoolean());
+            Assert.HasCount(1, acceptedEvents);
+            Assert.AreEqual("FraudProofAccepted", acceptedEvents[0].EventName);
+            Assert.AreEqual(chainId, (uint)acceptedEvents[0].State[0].GetInteger());
+            Assert.AreEqual(batchNumber, (ulong)acceptedEvents[0].State[1].GetInteger());
+            Assert.AreEqual(claimed, AsUInt256(acceptedEvents[0].State[2]));
+            Assert.AreEqual(replayed, AsUInt256(acceptedEvents[0].State[3]));
+
+            var v2Payload = GovernanceFraudPayload(2, claimed, replayed, [0x10, 0x11, 0x12]);
+            Assert.IsTrue(verifier.Call(snapshot, "verifyFraud",
+                Integer(chainId), Integer(batchNumber), Bytes(v2Payload)).GetBoolean());
+        }
+
+        [TestMethod]
+        public void GovernanceFraudVerifier_RejectsMalformedPayloadsWithReasons()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var verifier = NeoHubGovernanceFraudVerifier();
+            var claimed = H256(0xc3);
+            var replayed = H256(0xc4);
+            const uint chainId = 1026;
+            const ulong batchNumber = 10;
+
+            AssertRejected(verifier, snapshot, GovernanceFraudPayload(1, claimed, replayed).Take(100).ToArray(),
+                NeoHubGovernanceFraudVerifierContract.ReasonBadLength);
+            AssertRejected(verifier, snapshot, GovernanceFraudPayload(9, claimed, replayed),
+                NeoHubGovernanceFraudVerifierContract.ReasonBadVersion);
+            AssertRejected(verifier, snapshot, GovernanceFraudPayload(1, claimed, claimed),
+                NeoHubGovernanceFraudVerifierContract.ReasonNoDiscrepancy);
+            AssertRejected(verifier, snapshot, GovernanceFraudPayload(2, claimed, replayed).Take(104).ToArray(),
+                NeoHubGovernanceFraudVerifierContract.ReasonBadLength);
+
+            var oversizedWitness = GovernanceFraudPayload(2, claimed, replayed);
+            WriteU32(oversizedWitness, 101, NeoHubGovernanceFraudVerifierContract.MaxDisputedTxBytes + 1U);
+            AssertRejected(verifier, snapshot, oversizedWitness,
+                NeoHubGovernanceFraudVerifierContract.ReasonOversizedWitness);
+
+            var mismatchedWitness = GovernanceFraudPayload(2, claimed, replayed, [0x01, 0x02]);
+            WriteU32(mismatchedWitness, 101, 3);
+            AssertRejected(verifier, snapshot, mismatchedWitness,
+                NeoHubGovernanceFraudVerifierContract.ReasonBadLength);
+
+            void AssertRejected(NativeContract contract, DataCache cache, byte[] payload, byte reason)
+            {
+                var rejectedEvents = new System.Collections.Generic.List<NotifyEventArgs>();
+                Assert.IsFalse(contract.Call(cache, "verifyFraud", (_, e) => rejectedEvents.Add(e),
+                    Integer(chainId), Integer(batchNumber), Bytes(payload)).GetBoolean());
+                Assert.HasCount(1, rejectedEvents);
+                Assert.AreEqual("FraudProofRejected", rejectedEvents[0].EventName);
+                Assert.AreEqual(chainId, (uint)rejectedEvents[0].State[0].GetInteger());
+                Assert.AreEqual(batchNumber, (ulong)rejectedEvents[0].State[1].GetInteger());
+                Assert.AreEqual(reason, (byte)rejectedEvents[0].State[2].GetInteger());
+            }
+        }
+
         private static Block Block(ulong timestamp = 1000) => new()
         {
             Header = new Header
@@ -1358,6 +1433,8 @@ namespace Neo.UnitTests.SmartContract.Native
         private static NativeContract NeoHubForcedInclusion() => NativeContract.NeoHubForcedInclusion;
 
         private static NativeContract NeoHubOptimisticChallenge() => NativeContract.NeoHubOptimisticChallenge;
+
+        private static NativeContract NeoHubGovernanceFraudVerifier() => NativeContract.NeoHubGovernanceFraudVerifier;
 
         private static UInt160 AsUInt160(StackItem item) => new(item.GetSpan());
 
@@ -1601,6 +1678,24 @@ namespace Neo.UnitTests.SmartContract.Native
             withdrawalRoot.ToArray().CopyTo(bytes, 156);
             daCommitment.ToArray().CopyTo(bytes, 252);
             bytes[316] = proofType;
+            return bytes;
+        }
+
+        private static byte[] GovernanceFraudPayload(byte version, UInt256 claimedRoot, UInt256 replayedRoot, byte[] disputedTxBytes = null)
+        {
+            disputedTxBytes ??= [];
+            var length = version == 2 ? 105 + disputedTxBytes.Length : 101;
+            var bytes = new byte[length];
+            bytes[0] = version;
+            H256(0xc0).ToArray().CopyTo(bytes, 1);
+            claimedRoot.ToArray().CopyTo(bytes, 33);
+            replayedRoot.ToArray().CopyTo(bytes, 65);
+            WriteU32(bytes, 97, 3);
+            if (version == 2)
+            {
+                WriteU32(bytes, 101, (uint)disputedTxBytes.Length);
+                disputedTxBytes.CopyTo(bytes, 105);
+            }
             return bytes;
         }
 

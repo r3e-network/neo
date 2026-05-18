@@ -185,6 +185,11 @@ namespace Neo.SmartContract.Native
         /// </summary>
         public static NeoHubOptimisticChallengeContract NeoHubOptimisticChallenge { get; } = new();
 
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubGovernanceFraudVerifierContract"/> class.
+        /// </summary>
+        public static NeoHubGovernanceFraudVerifierContract NeoHubGovernanceFraudVerifier { get; } = new();
+
         #endregion
 
         /// <summary>
