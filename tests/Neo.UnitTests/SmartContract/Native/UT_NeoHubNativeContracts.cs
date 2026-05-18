@@ -5,6 +5,7 @@
 
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Neo.Cryptography;
+using Neo.Cryptography.ECC;
 using Neo.Extensions;
 using Neo.Network.P2P.Payloads;
 using Neo.Persistence;
@@ -14,6 +15,7 @@ using Neo.SmartContract.Native;
 using Neo.UnitTests.Extensions;
 using Neo.VM;
 using Neo.VM.Types;
+using Neo.Wallets;
 using System;
 using System.Linq;
 
@@ -32,7 +34,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubL1TxFilter,
             NativeContract.NeoHubVerifierRegistry,
             NativeContract.NeoHubMessageRouter,
-            NativeContract.NeoHubSettlementManager
+            NativeContract.NeoHubSettlementManager,
+            NativeContract.NeoHubDAValidator
         ];
 
         [TestInitialize]
@@ -147,6 +150,84 @@ namespace Neo.UnitTests.SmartContract.Native
                 "getCommitment", Integer(1003), Integer(7))));
             Assert.AreEqual(1, NativeContract.NeoHubDARegistry.Call(snapshot,
                 "getMode", Integer(1003), Integer(7)).GetInteger());
+        }
+
+        [TestMethod]
+        public void DAValidator_ConfiguresAndValidatesNonDacModes()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0x3a);
+            var daRegistry = H(0x3b);
+            var commitment = H256(0x3c);
+
+            NativeContract.NeoHubDAValidator.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(daRegistry));
+
+            Assert.AreEqual(owner, AsUInt160(NativeContract.NeoHubDAValidator.Call(snapshot, "getOwner")));
+            Assert.AreEqual(daRegistry, AsUInt160(NativeContract.NeoHubDAValidator.Call(snapshot, "getDARegistry")));
+
+            Assert.IsTrue(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "validate", Integer(1009), Integer(1), Hash256(commitment), Integer(0)).GetBoolean());
+            Assert.IsTrue(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "validate", Integer(1009), Integer(1), Hash256(commitment), Integer(1)).GetBoolean());
+            Assert.IsTrue(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "validate", Integer(1009), Integer(1), Hash256(commitment), Integer(2)).GetBoolean());
+            Assert.IsFalse(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "validate", Integer(1009), Integer(1), Hash256(commitment), Integer(3)).GetBoolean());
+            Assert.IsFalse(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "validate", Integer(0), Integer(1), Hash256(commitment), Integer(0)).GetBoolean());
+            Assert.IsFalse(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "validate", Integer(1009), Integer(1), Hash256(UInt256.Zero), Integer(0)).GetBoolean());
+            Assert.IsFalse(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "validate", Integer(1009), Integer(1), Hash256(commitment), Integer(4)).GetBoolean());
+        }
+
+        [TestMethod]
+        public void DAValidator_RegistersCommitteeAndStoresDacAttestations()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0x3d);
+            var daRegistry = H(0x3e);
+            var chainId = 1010u;
+            var batchNumber = 2UL;
+            var commitment = H256(0x3f);
+            var key1 = Key(0x01);
+            var key2 = Key(0x02);
+            var committeeBlob = key1.PublicKey.EncodePoint(true)
+                .Concat(key2.PublicKey.EncodePoint(true))
+                .ToArray();
+            var message = DAAttestationMessage(chainId, batchNumber, commitment, 3);
+            var proof = DAAttestationProof(message, key1, key2);
+
+            NativeContract.NeoHubDAValidator.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(daRegistry));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubDAValidator.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), block,
+                    "registerCommittee", Integer(chainId), Integer(2), Bytes(committeeBlob)));
+
+            NativeContract.NeoHubDAValidator.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerCommittee", Integer(chainId), Integer(2), Bytes(committeeBlob));
+
+            CollectionAssert.AreEqual(new byte[] { 2, 2 }.Concat(committeeBlob).ToArray(),
+                NativeContract.NeoHubDAValidator.Call(snapshot, "getCommittee", Integer(chainId)).GetSpan().ToArray());
+            Assert.IsTrue(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "verifyAttestation", Integer(chainId), Integer(batchNumber), Hash256(commitment), Integer(3), Bytes(proof)).GetBoolean());
+            Assert.IsTrue(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "submitAttestation", Integer(chainId), Integer(batchNumber), Hash256(commitment), Integer(3), Bytes(proof)).GetBoolean());
+            Assert.IsTrue(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "isValidated", Integer(chainId), Integer(batchNumber), Hash256(commitment), Integer(3)).GetBoolean());
+            Assert.IsTrue(NativeContract.NeoHubDAValidator.Call(snapshot,
+                "validate", Integer(chainId), Integer(batchNumber), Hash256(commitment), Integer(3)).GetBoolean());
+
+            var duplicateSignerProof = DAAttestationProof(message, ((byte)0, key1), ((byte)0, key1));
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubDAValidator.Call(snapshot,
+                    "verifyAttestation", Integer(chainId), Integer(batchNumber), Hash256(commitment), Integer(3), Bytes(duplicateSignerProof)));
         }
 
         [TestMethod]
@@ -277,13 +358,13 @@ namespace Neo.UnitTests.SmartContract.Native
             var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
             var owner = H(0x88);
             var chainId = 1008u;
-            var verifierAndValidator = AlwaysTrueContract();
+            var verifier = AlwaysTrueContract();
             var postStateRoot = H256(0x89);
             var withdrawalRoot = H256(0x8a);
             var daCommitment = H256(0x8b);
             var commitment = BatchCommitment(chainId, 1, 1, postStateRoot, withdrawalRoot, daCommitment);
 
-            snapshot.AddContract(verifierAndValidator.Hash, verifierAndValidator);
+            snapshot.AddContract(verifier.Hash, verifier);
 
             NativeContract.NeoHubChainRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
                 "configure", Hash160(owner));
@@ -294,17 +375,19 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubVerifierRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
                 "configure", Hash160(owner));
             NativeContract.NeoHubVerifierRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
-                "registerVerifier", Integer(1), Hash160(verifierAndValidator.Hash));
+                "registerVerifier", Integer(1), Hash160(verifier.Hash));
 
             NativeContract.NeoHubDARegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
                 "configure", Hash160(owner), Hash160(NativeContract.NeoHubSettlementManager.Hash));
+            NativeContract.NeoHubDAValidator.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(NativeContract.NeoHubDARegistry.Hash));
             NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
                 "configure", Hash160(owner), Hash160(NativeContract.NeoHubChainRegistry.Hash),
                 Hash160(NativeContract.NeoHubVerifierRegistry.Hash));
             NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
                 "setDARegistry", Hash160(NativeContract.NeoHubDARegistry.Hash));
             NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
-                "setDAValidator", Hash160(verifierAndValidator.Hash));
+                "setDAValidator", Hash160(NativeContract.NeoHubDAValidator.Hash));
 
             NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
                 "submitBatch", Bytes(commitment));
@@ -388,6 +471,50 @@ namespace Neo.UnitTests.SmartContract.Native
         private static UInt160 AsUInt160(StackItem item) => new(item.GetSpan());
 
         private static UInt256 AsUInt256(StackItem item) => new(item.GetSpan());
+
+        private static KeyPair Key(byte seed)
+        {
+            var bytes = Enumerable.Repeat(seed, 32).ToArray();
+            return new KeyPair(bytes);
+        }
+
+        private static byte[] DAAttestationProof(byte[] message, params KeyPair[] keys)
+        {
+            return DAAttestationProof(message, keys.Select((key, index) => ((byte)index, key)).ToArray());
+        }
+
+        private static byte[] DAAttestationProof(byte[] message, params (byte SignerIndex, KeyPair Key)[] signers)
+        {
+            var proof = new byte[2 + signers.Length * 65];
+            proof[0] = (byte)signers.Length;
+            proof[1] = (byte)(signers.Length >> 8);
+            for (var i = 0; i < signers.Length; i++)
+            {
+                var offset = 2 + i * 65;
+                proof[offset] = signers[i].SignerIndex;
+                Crypto.Sign(message, signers[i].Key.PrivateKey, ECCurve.Secp256r1, Neo.Cryptography.HashAlgorithm.SHA256)
+                    .CopyTo(proof, offset + 1);
+            }
+            return proof;
+        }
+
+        private static byte[] DAAttestationMessage(uint chainId, ulong batchNumber, UInt256 commitment, byte daMode)
+        {
+            var bytes = new byte[49];
+            var offset = 0;
+            bytes[offset++] = 0x4e;
+            bytes[offset++] = 0x34;
+            bytes[offset++] = 0x44;
+            bytes[offset++] = 0x41;
+            WriteU32(bytes, offset, chainId);
+            offset += 4;
+            WriteU64(bytes, offset, batchNumber);
+            offset += 8;
+            commitment.ToArray().CopyTo(bytes, offset);
+            offset += UInt256.Length;
+            bytes[offset] = daMode;
+            return bytes;
+        }
 
         private static ContractState AlwaysTrueContract()
         {

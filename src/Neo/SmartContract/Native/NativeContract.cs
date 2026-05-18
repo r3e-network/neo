@@ -126,6 +126,11 @@ namespace Neo.SmartContract.Native
         public static NeoHubDARegistryContract NeoHubDARegistry { get; } = new();
 
         /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubDAValidatorContract"/> class.
+        /// </summary>
+        public static NeoHubDAValidatorContract NeoHubDAValidator { get; } = new();
+
+        /// <summary>
         /// Gets the instance of the <see cref="Native.NeoHubL1TxFilterContract"/> class.
         /// </summary>
         public static NeoHubL1TxFilterContract NeoHubL1TxFilter { get; } = new();
