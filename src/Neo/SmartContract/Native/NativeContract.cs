@@ -110,6 +110,26 @@ namespace Neo.SmartContract.Native
         /// </summary>
         public static Treasury Treasury { get; } = new();
 
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubChainRegistryContract"/> class.
+        /// </summary>
+        public static NeoHubChainRegistryContract NeoHubChainRegistry { get; } = new();
+
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubTokenRegistryContract"/> class.
+        /// </summary>
+        public static NeoHubTokenRegistryContract NeoHubTokenRegistry { get; } = new();
+
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubDARegistryContract"/> class.
+        /// </summary>
+        public static NeoHubDARegistryContract NeoHubDARegistry { get; } = new();
+
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubL1TxFilterContract"/> class.
+        /// </summary>
+        public static NeoHubL1TxFilterContract NeoHubL1TxFilter { get; } = new();
+
         #endregion
 
         /// <summary>
@@ -141,13 +161,14 @@ namespace Neo.SmartContract.Native
         /// <summary>
         /// The id of the native contract.
         /// </summary>
-        public int Id { get; } = --idCounter;
+        public int Id { get; }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="NativeContract"/> class.
         /// </summary>
         protected NativeContract()
         {
+            Id = --idCounter;
             Hash = Helper.GetContractHash(UInt160.Zero, 0, Name);
 
             // Reflection to get the methods
@@ -163,12 +184,12 @@ namespace Neo.SmartContract.Native
             _methodDescriptors = listMethods.OrderBy(p => p.Name, StringComparer.Ordinal).ThenBy(p => p.Parameters.Length).ToList().AsReadOnly();
 
             // Reflection to get the events
+            var currentCtor = GetType().GetConstructor(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null, Array.Empty<Type>(), null);
+            var baseCtor = GetType().BaseType?.GetConstructor(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null, Array.Empty<Type>(), null);
             _eventsDescriptors =
-                GetType().GetConstructor(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null, Array.Empty<Type>(), null)!.
-                GetCustomAttributes<ContractEventAttribute>().
+                (currentCtor?.GetCustomAttributes<ContractEventAttribute>() ?? []).
                 // Take into account not only the contract constructor, but also the base type constructor for proper FungibleToken events handling.
-                Concat(GetType().BaseType?.GetConstructor(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null, Array.Empty<Type>(), null)!.
-                GetCustomAttributes<ContractEventAttribute>() ?? []).
+                Concat(baseCtor?.GetCustomAttributes<ContractEventAttribute>() ?? []).
                 OrderBy(p => p.Order).ToList().AsReadOnly();
 
             // Calculate the initializations forks
@@ -184,6 +205,52 @@ namespace Neo.SmartContract.Native
                     .Cast<Hardfork>().ToImmutableHashSet();
             s_contractsList.Add(this);
             s_contractsDictionary.Add(Hash, this);
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="NativeContract"/> class with
+        /// an explicit protocol id.
+        /// </summary>
+        protected NativeContract(int id)
+        {
+            Id = id;
+            Hash = Helper.GetContractHash(UInt160.Zero, 0, Name);
+
+            List<ContractMethodMetadata> listMethods = [];
+            foreach (var member in GetType().GetMembers(BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
+            {
+                foreach (var attribute in member.GetCustomAttributes<ContractMethodAttribute>())
+                {
+                    listMethods.Add(new ContractMethodMetadata(member, attribute));
+                }
+            }
+            _methodDescriptors = listMethods.OrderBy(p => p.Name, StringComparer.Ordinal).ThenBy(p => p.Parameters.Length).ToList().AsReadOnly();
+
+            var currentCtor = GetType().GetConstructor(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null, Array.Empty<Type>(), null);
+            var baseCtor = GetType().BaseType?.GetConstructor(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null, Array.Empty<Type>(), null);
+            _eventsDescriptors =
+                (currentCtor?.GetCustomAttributes<ContractEventAttribute>() ?? []).
+                Concat(baseCtor?.GetCustomAttributes<ContractEventAttribute>() ?? []).
+                OrderBy(p => p.Order).ToList().AsReadOnly();
+
+            _usedHardforks =
+                _methodDescriptors.Select(u => u.ActiveIn)
+                    .Concat(_methodDescriptors.Select(u => u.DeprecatedIn))
+                    .Concat(_eventsDescriptors.Select(u => u.DeprecatedIn))
+                    .Concat(_eventsDescriptors.Select(u => u.ActiveIn))
+                    .Concat(Activations)
+                    .Where(u => u.HasValue)
+                    .Select(u => u!.Value)
+                    .OrderBy(u => (byte)u)
+                    .Cast<Hardfork>().ToImmutableHashSet();
+
+            s_contractsList.Add(this);
+            s_contractsDictionary.Add(Hash, this);
+        }
+
+        protected void Notify(ApplicationEngine engine, string eventName, params object?[] args)
+        {
+            engine.SendNotification(Hash, eventName, new(engine.ReferenceCounter, args.Select(engine.Convert)));
         }
 
         /// <summary>
