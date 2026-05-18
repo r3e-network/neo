@@ -140,6 +140,11 @@ namespace Neo.SmartContract.Native
         /// </summary>
         public static NeoHubMessageRouterContract NeoHubMessageRouter { get; } = new();
 
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubSettlementManagerContract"/> class.
+        /// </summary>
+        public static NeoHubSettlementManagerContract NeoHubSettlementManager { get; } = new();
+
         #endregion
 
         /// <summary>

@@ -4,10 +4,12 @@
 // r3e/neo-n3-core branch.
 
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Neo.Cryptography;
 using Neo.Extensions;
 using Neo.Network.P2P.Payloads;
 using Neo.Persistence;
 using Neo.SmartContract;
+using Neo.SmartContract.Manifest;
 using Neo.SmartContract.Native;
 using Neo.UnitTests.Extensions;
 using Neo.VM;
@@ -29,7 +31,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubDARegistry,
             NativeContract.NeoHubL1TxFilter,
             NativeContract.NeoHubVerifierRegistry,
-            NativeContract.NeoHubMessageRouter
+            NativeContract.NeoHubMessageRouter,
+            NativeContract.NeoHubSettlementManager
         ];
 
         [TestInitialize]
@@ -232,6 +235,123 @@ namespace Neo.UnitTests.SmartContract.Native
                 "getL1TxFilter", Integer(1005))));
         }
 
+        [TestMethod]
+        public void SettlementManager_ConfiguresWiringAndRejectsInactiveChains()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0x81);
+            var daRegistry = H(0x82);
+            var daValidator = H(0x83);
+            var commitment = BatchCommitment(1006, 1, 1);
+
+            NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(NativeContract.NeoHubChainRegistry.Hash),
+                Hash160(NativeContract.NeoHubVerifierRegistry.Hash));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), block,
+                    "setDARegistry", Hash160(daRegistry)));
+
+            NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setDARegistry", Hash160(daRegistry));
+            NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setDAValidator", Hash160(daValidator));
+
+            Assert.AreEqual(owner, AsUInt160(NativeContract.NeoHubSettlementManager.Call(snapshot, "getOwner")));
+            Assert.AreEqual(daRegistry, AsUInt160(NativeContract.NeoHubSettlementManager.Call(snapshot, "getDARegistry")));
+            Assert.AreEqual(daValidator, AsUInt160(NativeContract.NeoHubSettlementManager.Call(snapshot, "getDAValidator")));
+            Assert.AreEqual(UInt160.Zero, AsUInt160(NativeContract.NeoHubSettlementManager.Call(snapshot, "getOptimisticChallenge")));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                    "submitBatch", Bytes(commitment)));
+        }
+
+        [TestMethod]
+        public void SettlementManager_SubmitsAndFinalizesBatchesThroughRegistries()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0x88);
+            var chainId = 1008u;
+            var verifierAndValidator = AlwaysTrueContract();
+            var postStateRoot = H256(0x89);
+            var withdrawalRoot = H256(0x8a);
+            var daCommitment = H256(0x8b);
+            var commitment = BatchCommitment(chainId, 1, 1, postStateRoot, withdrawalRoot, daCommitment);
+
+            snapshot.AddContract(verifierAndValidator.Hash, verifierAndValidator);
+
+            NativeContract.NeoHubChainRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner));
+            NativeContract.NeoHubChainRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerChain", Integer(chainId), Bytes(ChainConfig(chainId, securityLevel: 3, daMode: 1, gatewayEnabled: true,
+                    permissionlessExit: true, sequencerModel: 1, exitModel: 0, active: true)));
+
+            NativeContract.NeoHubVerifierRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner));
+            NativeContract.NeoHubVerifierRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerVerifier", Integer(1), Hash160(verifierAndValidator.Hash));
+
+            NativeContract.NeoHubDARegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(NativeContract.NeoHubSettlementManager.Hash));
+            NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(NativeContract.NeoHubChainRegistry.Hash),
+                Hash160(NativeContract.NeoHubVerifierRegistry.Hash));
+            NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setDARegistry", Hash160(NativeContract.NeoHubDARegistry.Hash));
+            NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setDAValidator", Hash160(verifierAndValidator.Hash));
+
+            NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "submitBatch", Bytes(commitment));
+
+            Assert.AreEqual(NeoHubSettlementManagerContract.StatusPending, NativeContract.NeoHubSettlementManager.Call(snapshot,
+                "getBatchStatus", Integer(chainId), Integer(1)).GetInteger());
+            Assert.AreEqual(daCommitment, AsUInt256(NativeContract.NeoHubDARegistry.Call(snapshot,
+                "getCommitment", Integer(chainId), Integer(1))));
+
+            NativeContract.NeoHubSettlementManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "finalizeBatch", Integer(chainId), Integer(1));
+
+            Assert.AreEqual(NeoHubSettlementManagerContract.StatusFinalized, NativeContract.NeoHubSettlementManager.Call(snapshot,
+                "getBatchStatus", Integer(chainId), Integer(1)).GetInteger());
+            Assert.AreEqual(1, NativeContract.NeoHubSettlementManager.Call(snapshot,
+                "getLatestFinalizedBatch", Integer(chainId)).GetInteger());
+            Assert.AreEqual(postStateRoot, AsUInt256(NativeContract.NeoHubSettlementManager.Call(snapshot,
+                "getCanonicalStateRoot", Integer(chainId))));
+            Assert.IsTrue(NativeContract.NeoHubSettlementManager.Call(snapshot,
+                "verifyWithdrawalLeafAt", Integer(chainId), Integer(1), Hash256(withdrawalRoot)).GetBoolean());
+        }
+
+        [TestMethod]
+        public void SettlementManager_VerifiesWithdrawalProofsOnlyForFinalizedBatches()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            const uint chainId = 1007;
+            const ulong batchNumber = 1;
+            var leaf = H256(0x91);
+            var sibling = H256(0x92);
+            var root = HashPair(leaf, sibling);
+            var siblings = ArrayParam(Bytes(sibling.ToArray()));
+
+            snapshot.Add(SettlementKey(0x01, chainId, batchNumber), new StorageItem([2]));
+            snapshot.Add(SettlementKey(0x05, chainId, batchNumber), new StorageItem(root.ToArray()));
+
+            Assert.IsFalse(NativeContract.NeoHubSettlementManager.Call(snapshot,
+                "verifyWithdrawalLeafWithProof", Integer(chainId), Integer(batchNumber), Hash256(leaf), siblings, Integer(0)).GetBoolean());
+
+            snapshot.GetAndChange(SettlementKey(0x01, chainId, batchNumber))!.Value = new byte[] { 3 };
+
+            Assert.IsTrue(NativeContract.NeoHubSettlementManager.Call(snapshot,
+                "verifyWithdrawalLeafWithProof", Integer(chainId), Integer(batchNumber), Hash256(leaf), siblings, Integer(0)).GetBoolean());
+            Assert.IsFalse(NativeContract.NeoHubSettlementManager.Call(snapshot,
+                "verifyWithdrawalLeafWithProof", Integer(chainId), Integer(batchNumber), Hash256(leaf), siblings, Integer(1)).GetBoolean());
+        }
+
         private static Block Block() => new()
         {
             Header = new Header
@@ -262,9 +382,60 @@ namespace Neo.UnitTests.SmartContract.Native
 
         private static ContractParameter Bytes(byte[] value) => new(ContractParameterType.ByteArray) { Value = value };
 
+        private static ContractParameter ArrayParam(params ContractParameter[] value) =>
+            new(ContractParameterType.Array) { Value = value.ToList() };
+
         private static UInt160 AsUInt160(StackItem item) => new(item.GetSpan());
 
         private static UInt256 AsUInt256(StackItem item) => new(item.GetSpan());
+
+        private static ContractState AlwaysTrueContract()
+        {
+            using var script = new ScriptBuilder();
+            const int verifyOffset = 0;
+            script.Emit(OpCode.DROP);
+            script.EmitPush(true);
+            script.Emit(OpCode.RET);
+            var validateOffset = script.ToArray().Length;
+            script.Emit(OpCode.DROP);
+            script.Emit(OpCode.DROP);
+            script.Emit(OpCode.DROP);
+            script.Emit(OpCode.DROP);
+            script.EmitPush(true);
+            script.Emit(OpCode.RET);
+
+            var manifest = Neo.UnitTests.TestUtils.CreateDefaultManifest();
+            manifest.Name = "NeoHubAlwaysTrue";
+            manifest.Abi.Methods =
+            [
+                new ContractMethodDescriptor
+                {
+                    Name = "verify",
+                    Parameters =
+                    [
+                        new ContractParameterDefinition { Name = "commitmentBytes", Type = ContractParameterType.ByteArray }
+                    ],
+                    ReturnType = ContractParameterType.Boolean,
+                    Offset = verifyOffset,
+                    Safe = true
+                },
+                new ContractMethodDescriptor
+                {
+                    Name = "validate",
+                    Parameters =
+                    [
+                        new ContractParameterDefinition { Name = "chainId", Type = ContractParameterType.Integer },
+                        new ContractParameterDefinition { Name = "batchNumber", Type = ContractParameterType.Integer },
+                        new ContractParameterDefinition { Name = "daCommitment", Type = ContractParameterType.Hash256 },
+                        new ContractParameterDefinition { Name = "daMode", Type = ContractParameterType.Integer }
+                    ],
+                    ReturnType = ContractParameterType.Boolean,
+                    Offset = validateOffset,
+                    Safe = true
+                }
+            ];
+            return Neo.UnitTests.TestUtils.GetContract(script.ToArray(), manifest);
+        }
 
         private static StackItem CallAsScript(
             NativeContract contract,
@@ -330,12 +501,63 @@ namespace Neo.UnitTests.SmartContract.Native
             return bytes;
         }
 
+        private static byte[] BatchCommitment(uint chainId, ulong batchNumber, byte proofType)
+        {
+            return BatchCommitment(chainId, batchNumber, proofType, H256(0x85), H256(0x86), H256(0x84));
+        }
+
+        private static byte[] BatchCommitment(
+            uint chainId,
+            ulong batchNumber,
+            byte proofType,
+            UInt256 postStateRoot,
+            UInt256 withdrawalRoot,
+            UInt256 daCommitment)
+        {
+            var bytes = new byte[317];
+            WriteU32(bytes, 0, chainId);
+            WriteU64(bytes, 4, batchNumber);
+            postStateRoot.ToArray().CopyTo(bytes, 60);
+            withdrawalRoot.ToArray().CopyTo(bytes, 156);
+            daCommitment.ToArray().CopyTo(bytes, 252);
+            bytes[316] = proofType;
+            return bytes;
+        }
+
+        private static StorageKey SettlementKey(byte prefix, uint chainId, ulong batchNumber)
+        {
+            var key = new byte[12];
+            WriteU32(key, 0, chainId);
+            WriteU64(key, 4, batchNumber);
+            return StorageKey.Create(NativeContract.NeoHubSettlementManager.Id, prefix, key);
+        }
+
+        private static UInt256 HashPair(UInt256 left, UInt256 right)
+        {
+            var bytes = new byte[UInt256.Length * 2];
+            left.ToArray().CopyTo(bytes, 0);
+            right.ToArray().CopyTo(bytes, UInt256.Length);
+            return new UInt256(Crypto.Hash256(bytes));
+        }
+
         private static void WriteU32(byte[] bytes, int offset, uint value)
         {
             bytes[offset] = (byte)value;
             bytes[offset + 1] = (byte)(value >> 8);
             bytes[offset + 2] = (byte)(value >> 16);
             bytes[offset + 3] = (byte)(value >> 24);
+        }
+
+        private static void WriteU64(byte[] bytes, int offset, ulong value)
+        {
+            bytes[offset] = (byte)value;
+            bytes[offset + 1] = (byte)(value >> 8);
+            bytes[offset + 2] = (byte)(value >> 16);
+            bytes[offset + 3] = (byte)(value >> 24);
+            bytes[offset + 4] = (byte)(value >> 32);
+            bytes[offset + 5] = (byte)(value >> 40);
+            bytes[offset + 6] = (byte)(value >> 48);
+            bytes[offset + 7] = (byte)(value >> 56);
         }
     }
 }
