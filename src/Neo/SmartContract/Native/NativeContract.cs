@@ -165,6 +165,11 @@ namespace Neo.SmartContract.Native
         /// </summary>
         public static NeoHubGovernanceControllerContract NeoHubGovernanceController { get; } = new();
 
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubSequencerBondContract"/> class.
+        /// </summary>
+        public static NeoHubSequencerBondContract NeoHubSequencerBond { get; } = new();
+
         #endregion
 
         /// <summary>

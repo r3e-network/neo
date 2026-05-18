@@ -39,7 +39,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubDAValidator,
             NativeContract.NeoHubSharedBridge,
             NativeContract.NeoHubEmergencyManager,
-            NativeContract.NeoHubGovernanceController
+            NativeContract.NeoHubGovernanceController,
+            NativeContract.NeoHubSequencerBond
         ];
 
         [TestInitialize]
@@ -843,6 +844,106 @@ namespace Neo.UnitTests.SmartContract.Native
                 "isActive", Integer(chainId)).GetBoolean());
         }
 
+        [TestMethod]
+        public void SequencerBond_ConfiguresSlashersAndMinimumBond()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xc1);
+            var slasher = H(0xc2);
+            var nextSlasher = H(0xc3);
+            var token = TransferTokenContract();
+            var bond = NeoHubSequencerBond();
+
+            snapshot.AddContract(token.Hash, token);
+
+            bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(token.Hash), ArrayParam(Hash160(slasher)));
+
+            Assert.AreEqual(owner, AsUInt160(bond.Call(snapshot, "getOwner")));
+            Assert.AreEqual(token.Hash, AsUInt160(bond.Call(snapshot, "getBondAsset")));
+            Assert.AreEqual(new BigInteger(1_000_000UL), bond.Call(snapshot, "getMinBond").GetInteger());
+            Assert.IsTrue(bond.Call(snapshot, "isSlasher", Hash160(slasher)).GetBoolean());
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(H(0xc4)), block,
+                    "setMinBond", Integer(2_000_000)));
+            Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+                bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                    "setMinBond", Integer(0)));
+
+            bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setMinBond", Integer(2_000_000));
+            Assert.AreEqual(new BigInteger(2_000_000), bond.Call(snapshot, "getMinBond").GetInteger());
+
+            bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerSlasher", Hash160(nextSlasher));
+            Assert.IsTrue(bond.Call(snapshot, "isSlasher", Hash160(nextSlasher)).GetBoolean());
+
+            bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "revokeSlasher", Hash160(slasher));
+            Assert.IsFalse(bond.Call(snapshot, "isSlasher", Hash160(slasher)).GetBoolean());
+        }
+
+        [TestMethod]
+        public void SequencerBond_DepositsSlashesAndWithdraws()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xd1);
+            var slasher = H(0xd2);
+            var sponsor = H(0xd3);
+            var sequencer = H(0xd4);
+            var recipient = H(0xd5);
+            const uint chainId = 1018;
+            const long depositAmount = 1_500_000;
+            const long slashAmount = 500_000;
+            const long withdrawAmount = 400_000;
+            var token = TransferTokenContract();
+            var bond = NeoHubSequencerBond();
+
+            snapshot.AddContract(token.Hash, token);
+
+            Assert.IsFalse(bond.Call(snapshot, "hasMinBond", Integer(chainId), Hash160(sequencer)).GetBoolean());
+
+            bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(token.Hash), ArrayParam(Hash160(slasher)));
+
+            Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+                CallAsScript(bond, snapshot, sponsor, block,
+                    "deposit", Integer(0), Hash160(sequencer), Integer(depositAmount)));
+
+            CallAsScript(bond, snapshot, sponsor, block,
+                "deposit", Integer(chainId), Hash160(sequencer), Integer(depositAmount));
+
+            Assert.AreEqual(new BigInteger(depositAmount), bond.Call(snapshot,
+                "getBalance", Integer(chainId), Hash160(sequencer)).GetInteger());
+            Assert.IsTrue(bond.Call(snapshot, "hasMinBond", Integer(chainId), Hash160(sequencer)).GetBoolean());
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                CallAsScript(bond, snapshot, H(0xd6), block,
+                    "slash", Integer(chainId), Hash160(sequencer), Integer(slashAmount), Hash160(recipient)));
+
+            CallAsScript(bond, snapshot, slasher, block,
+                "slash", Integer(chainId), Hash160(sequencer), Integer(slashAmount), Hash160(recipient));
+
+            Assert.AreEqual(new BigInteger(1_000_000), bond.Call(snapshot,
+                "getBalance", Integer(chainId), Hash160(sequencer)).GetInteger());
+            Assert.IsTrue(bond.Call(snapshot, "hasMinBond", Integer(chainId), Hash160(sequencer)).GetBoolean());
+
+            bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "withdraw", Integer(chainId), Hash160(sequencer), Integer(withdrawAmount));
+
+            Assert.AreEqual(new BigInteger(600_000), bond.Call(snapshot,
+                "getBalance", Integer(chainId), Hash160(sequencer)).GetInteger());
+            Assert.IsFalse(bond.Call(snapshot, "hasMinBond", Integer(chainId), Hash160(sequencer)).GetBoolean());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                    "withdraw", Integer(chainId), Hash160(sequencer), Integer(1_000_000)));
+        }
+
         private static Block Block(ulong timestamp = 1000) => new()
         {
             Header = new Header
@@ -880,6 +981,8 @@ namespace Neo.UnitTests.SmartContract.Native
 
         private static ContractParameter ArrayParam(params ContractParameter[] value) =>
             new(ContractParameterType.Array) { Value = value.ToList() };
+
+        private static NativeContract NeoHubSequencerBond() => NativeContract.NeoHubSequencerBond;
 
         private static UInt160 AsUInt160(StackItem item) => new(item.GetSpan());
 
