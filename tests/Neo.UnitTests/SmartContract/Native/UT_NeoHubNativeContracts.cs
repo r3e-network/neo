@@ -42,7 +42,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubGovernanceController,
             NativeContract.NeoHubSequencerBond,
             NativeContract.NeoHubSequencerRegistry,
-            NativeContract.NeoHubForcedInclusion
+            NativeContract.NeoHubForcedInclusion,
+            NativeContract.NeoHubOptimisticChallenge
         ];
 
         [TestInitialize]
@@ -1169,6 +1170,149 @@ namespace Neo.UnitTests.SmartContract.Native
                     "reportCensorship", Integer(chainId), Integer(2), Hash160(sequencer)));
         }
 
+        [TestMethod]
+        public void OptimisticChallenge_ConfiguresOpensAndFinalizesExpiredWindow()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xa1);
+            var sequencer = H(0xa2);
+            const uint chainId = 1023;
+            const ulong batchNumber = 7;
+            var challenge = NeoHubOptimisticChallenge();
+            var settlement = NativeContract.NeoHubSettlementManager;
+            var chainRegistry = NativeContract.NeoHubChainRegistry;
+            var daValidator = AlwaysTrueContract();
+            var postStateRoot = H256(0xa3);
+            var header = BatchCommitment(chainId, batchNumber, 2, postStateRoot, H256(0xa4), H256(0xa5));
+
+            snapshot.AddContract(daValidator.Hash, daValidator);
+            chainRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), Block(1000),
+                "configure", Hash160(owner));
+            chainRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                "registerChain", Integer(chainId), Bytes(ChainConfig(chainId, 3, 0, true, true, 1, 0, true)));
+            settlement.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), Block(1000),
+                "configure", Hash160(owner), Hash160(chainRegistry.Hash), Hash160(NativeContract.NeoHubVerifierRegistry.Hash));
+            settlement.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                "setOptimisticChallenge", Hash160(challenge.Hash));
+            settlement.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                "setDAValidator", Hash160(daValidator.Hash));
+            snapshot.Add(SettlementKey(0x01, chainId, batchNumber), new StorageItem([NeoHubSettlementManagerContract.StatusChallengeable]));
+            snapshot.Add(SettlementKey(0x02, chainId, batchNumber), new StorageItem(header));
+
+            challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), Block(1000),
+                "configure", Hash160(owner), Hash160(settlement.Hash), Hash160(NativeContract.NeoHubSequencerBond.Hash));
+
+            Assert.AreEqual(owner, AsUInt160(challenge.Call(snapshot, "getOwner")));
+            Assert.AreEqual(settlement.Hash, AsUInt160(challenge.Call(snapshot, "getSettlementManager")));
+            Assert.AreEqual(NativeContract.NeoHubSequencerBond.Hash, AsUInt160(challenge.Call(snapshot, "getSequencerBond")));
+            Assert.AreEqual(3600, challenge.Call(snapshot, "getWindowSeconds").GetInteger());
+            Assert.AreEqual(5000, challenge.Call(snapshot, "getChallengerRewardBps").GetInteger());
+
+            Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+                challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                    "setWindowSeconds", Integer(59)));
+            Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+                challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                    "setChallengerRewardBps", Integer(0)));
+            challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                "setWindowSeconds", Integer(60));
+            challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                "setChallengerRewardBps", Integer(2500));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                    "openWindow", Integer(chainId), Integer(batchNumber), Hash160(sequencer)));
+
+            var deadline = challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(settlement.Hash), Block(1000),
+                "openWindow", Integer(chainId), Integer(batchNumber), Hash160(sequencer)).GetInteger();
+
+            Assert.AreEqual(61, deadline);
+            Assert.AreEqual(61, challenge.Call(snapshot, "getDeadline", Integer(chainId), Integer(batchNumber)).GetInteger());
+            Assert.AreEqual(sequencer, AsUInt160(challenge.Call(snapshot, "getSequencer", Integer(chainId), Integer(batchNumber))));
+            Assert.IsTrue(challenge.Call(snapshot, "isWindowOpen", Integer(chainId), Integer(batchNumber), Integer(61)).GetBoolean());
+            Assert.IsFalse(challenge.Call(snapshot, "isWindowOpen", Integer(chainId), Integer(batchNumber), Integer(62)).GetBoolean());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(settlement.Hash), Block(1000),
+                    "openWindow", Integer(chainId), Integer(batchNumber), Hash160(sequencer)));
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                CallAsScript(challenge, snapshot, H(0xa6), Block(61000),
+                    "finalizeIfPastWindow", Integer(chainId), Integer(batchNumber)));
+
+            CallAsScript(challenge, snapshot, H(0xa6), Block(62000),
+                "finalizeIfPastWindow", Integer(chainId), Integer(batchNumber));
+
+            Assert.AreEqual(NeoHubSettlementManagerContract.StatusFinalized,
+                settlement.Call(snapshot, "getBatchStatus", Integer(chainId), Integer(batchNumber)).GetInteger());
+            Assert.AreEqual(batchNumber, (ulong)settlement.Call(snapshot, "getLatestFinalizedBatch", Integer(chainId)).GetInteger());
+            Assert.AreEqual(postStateRoot, AsUInt256(settlement.Call(snapshot, "getCanonicalStateRoot", Integer(chainId))));
+        }
+
+        [TestMethod]
+        public void OptimisticChallenge_AcceptsFraudOnceAndSlashesSequencerBond()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xb1);
+            var sponsor = H(0xb2);
+            var sequencer = H(0xb3);
+            var challenger = H(0xb4);
+            const uint chainId = 1024;
+            const ulong batchNumber = 8;
+            const long bondAmount = 1_500_000;
+            var token = TransferTokenContract();
+            var verifier = FraudVerifierContract(true);
+            var rejectingVerifier = FraudVerifierContract(false);
+            var challenge = NeoHubOptimisticChallenge();
+            var settlement = NativeContract.NeoHubSettlementManager;
+            var bond = NeoHubSequencerBond();
+
+            snapshot.AddContract(token.Hash, token);
+            snapshot.AddContract(verifier.Hash, verifier);
+            snapshot.AddContract(rejectingVerifier.Hash, rejectingVerifier);
+            settlement.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), Block(1000),
+                "configure", Hash160(owner), Hash160(NativeContract.NeoHubChainRegistry.Hash), Hash160(NativeContract.NeoHubVerifierRegistry.Hash));
+            settlement.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                "setOptimisticChallenge", Hash160(challenge.Hash));
+            snapshot.Add(SettlementKey(0x01, chainId, batchNumber), new StorageItem([NeoHubSettlementManagerContract.StatusChallengeable]));
+            bond.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), Block(1000),
+                "configure", Hash160(owner), Hash160(token.Hash), ArrayParam(Hash160(challenge.Hash)));
+            CallAsScript(bond, snapshot, sponsor, Block(1000),
+                "deposit", Integer(chainId), Hash160(sequencer), Integer(bondAmount));
+
+            challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), Block(1000),
+                "configure", Hash160(owner), Hash160(settlement.Hash), Hash160(bond.Hash));
+            challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(1000),
+                "setWindowSeconds", Integer(60));
+            challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(settlement.Hash), Block(1000),
+                "openWindow", Integer(chainId), Integer(batchNumber), Hash160(sequencer));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(challenger), Block(1000),
+                    "challenge", Integer(chainId), Integer(batchNumber), Hash160(challenger), Bytes([0x01]), Hash160(rejectingVerifier.Hash)));
+            Assert.ThrowsExactly<ArgumentException>(() =>
+                challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(challenger), Block(1000),
+                    "challenge", Integer(chainId), Integer(batchNumber), Hash160(challenger), Bytes([]), Hash160(verifier.Hash)));
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(1000),
+                    "challenge", Integer(chainId), Integer(batchNumber), Hash160(challenger), Bytes([0x01]), Hash160(verifier.Hash)));
+
+            challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(challenger), Block(1000),
+                "challenge", Integer(chainId), Integer(batchNumber), Hash160(challenger), Bytes([0x01, 0x02]), Hash160(verifier.Hash));
+
+            Assert.IsTrue(challenge.Call(snapshot, "isFraudAccepted", Integer(chainId), Integer(batchNumber)).GetBoolean());
+            Assert.AreEqual(challenger, AsUInt160(challenge.Call(snapshot, "getAcceptedFraud", Integer(chainId), Integer(batchNumber))));
+            Assert.AreEqual(BigInteger.Zero, bond.Call(snapshot, "getBalance", Integer(chainId), Hash160(sequencer)).GetInteger());
+            Assert.AreEqual(NeoHubSettlementManagerContract.StatusReverted,
+                settlement.Call(snapshot, "getBatchStatus", Integer(chainId), Integer(batchNumber)).GetInteger());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                challenge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(challenger), Block(1000),
+                    "challenge", Integer(chainId), Integer(batchNumber), Hash160(challenger), Bytes([0x03]), Hash160(verifier.Hash)));
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                CallAsScript(challenge, snapshot, H(0xb5), Block(62000),
+                    "finalizeIfPastWindow", Integer(chainId), Integer(batchNumber)));
+        }
+
         private static Block Block(ulong timestamp = 1000) => new()
         {
             Header = new Header
@@ -1212,6 +1356,8 @@ namespace Neo.UnitTests.SmartContract.Native
         private static NativeContract NeoHubSequencerRegistry() => NativeContract.NeoHubSequencerRegistry;
 
         private static NativeContract NeoHubForcedInclusion() => NativeContract.NeoHubForcedInclusion;
+
+        private static NativeContract NeoHubOptimisticChallenge() => NativeContract.NeoHubOptimisticChallenge;
 
         private static UInt160 AsUInt160(StackItem item) => new(item.GetSpan());
 
@@ -1336,6 +1482,36 @@ namespace Neo.UnitTests.SmartContract.Native
                     ReturnType = ContractParameterType.Boolean,
                     Offset = 0,
                     Safe = false
+                }
+            ];
+            return Neo.UnitTests.TestUtils.GetContract(script.ToArray(), manifest);
+        }
+
+        private static ContractState FraudVerifierContract(bool result)
+        {
+            using var script = new ScriptBuilder();
+            script.Emit(OpCode.DROP);
+            script.Emit(OpCode.DROP);
+            script.Emit(OpCode.DROP);
+            script.EmitPush(result);
+            script.Emit(OpCode.RET);
+
+            var manifest = Neo.UnitTests.TestUtils.CreateDefaultManifest();
+            manifest.Name = result ? "NeoHubFraudVerifierTrue" : "NeoHubFraudVerifierFalse";
+            manifest.Abi.Methods =
+            [
+                new ContractMethodDescriptor
+                {
+                    Name = "verifyFraud",
+                    Parameters =
+                    [
+                        new ContractParameterDefinition { Name = "chainId", Type = ContractParameterType.Integer },
+                        new ContractParameterDefinition { Name = "batchNumber", Type = ContractParameterType.Integer },
+                        new ContractParameterDefinition { Name = "fraudProofBytes", Type = ContractParameterType.ByteArray }
+                    ],
+                    ReturnType = ContractParameterType.Boolean,
+                    Offset = 0,
+                    Safe = true
                 }
             ];
             return Neo.UnitTests.TestUtils.GetContract(script.ToArray(), manifest);

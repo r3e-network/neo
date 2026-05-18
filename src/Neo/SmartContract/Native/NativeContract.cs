@@ -180,6 +180,11 @@ namespace Neo.SmartContract.Native
         /// </summary>
         public static NeoHubForcedInclusionContract NeoHubForcedInclusion { get; } = new();
 
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubOptimisticChallengeContract"/> class.
+        /// </summary>
+        public static NeoHubOptimisticChallengeContract NeoHubOptimisticChallenge { get; } = new();
+
         #endregion
 
         /// <summary>
