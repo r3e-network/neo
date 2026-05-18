@@ -131,4 +131,151 @@ class ContractEventAttribute : Attribute, IHardforkActivable
             ]
         };
     }
+
+    public ContractEventAttribute(int order, string name,
+        string arg1Name, ContractParameterType arg1Value,
+        string arg2Name, ContractParameterType arg2Value,
+        string arg3Name, ContractParameterType arg3Value,
+        string arg4Name, ContractParameterType arg4Value,
+        string arg5Name, ContractParameterType arg5Value
+        )
+    {
+        Order = order;
+        Descriptor = new ContractEventDescriptor()
+        {
+            Name = name,
+            Parameters =
+            [
+                new ContractParameterDefinition()
+                {
+                    Name = arg1Name,
+                    Type = arg1Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg2Name,
+                    Type = arg2Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg3Name,
+                    Type = arg3Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg4Name,
+                    Type = arg4Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg5Name,
+                    Type = arg5Value
+                }
+            ]
+        };
+    }
+
+    public ContractEventAttribute(int order, string name,
+        string arg1Name, ContractParameterType arg1Value,
+        string arg2Name, ContractParameterType arg2Value,
+        string arg3Name, ContractParameterType arg3Value,
+        string arg4Name, ContractParameterType arg4Value,
+        string arg5Name, ContractParameterType arg5Value,
+        string arg6Name, ContractParameterType arg6Value
+        )
+    {
+        Order = order;
+        Descriptor = new ContractEventDescriptor()
+        {
+            Name = name,
+            Parameters =
+            [
+                new ContractParameterDefinition()
+                {
+                    Name = arg1Name,
+                    Type = arg1Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg2Name,
+                    Type = arg2Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg3Name,
+                    Type = arg3Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg4Name,
+                    Type = arg4Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg5Name,
+                    Type = arg5Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg6Name,
+                    Type = arg6Value
+                }
+            ]
+        };
+    }
+
+    public ContractEventAttribute(int order, string name,
+        string arg1Name, ContractParameterType arg1Value,
+        string arg2Name, ContractParameterType arg2Value,
+        string arg3Name, ContractParameterType arg3Value,
+        string arg4Name, ContractParameterType arg4Value,
+        string arg5Name, ContractParameterType arg5Value,
+        string arg6Name, ContractParameterType arg6Value,
+        string arg7Name, ContractParameterType arg7Value
+        )
+    {
+        Order = order;
+        Descriptor = new ContractEventDescriptor()
+        {
+            Name = name,
+            Parameters =
+            [
+                new ContractParameterDefinition()
+                {
+                    Name = arg1Name,
+                    Type = arg1Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg2Name,
+                    Type = arg2Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg3Name,
+                    Type = arg3Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg4Name,
+                    Type = arg4Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg5Name,
+                    Type = arg5Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg6Name,
+                    Type = arg6Value
+                },
+                new ContractParameterDefinition()
+                {
+                    Name = arg7Name,
+                    Type = arg7Value
+                }
+            ]
+        };
+    }
 }

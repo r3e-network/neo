@@ -100,6 +100,26 @@ public abstract class NativeContract
 
     public static Governance Governance { get; } = new();
 
+    public static L2SystemConfigContract L2SystemConfig { get; } = new();
+
+    public static L2BatchInfoContract L2BatchInfo { get; } = new();
+
+    public static L2MessageContract L2Message { get; } = new();
+
+    public static L2BridgeContract L2Bridge { get; } = new();
+
+    public static L2FeeContract L2Fee { get; } = new();
+
+    public static L2PaymasterContract L2Paymaster { get; } = new();
+
+    public static L2NativeExternalBridgeContract L2NativeExternalBridge { get; } = new();
+
+    public static L2AccountAbstraction L2AccountAbstraction { get; } = new();
+
+    public static BridgedNep17Contract BridgedNep17 { get; } = new();
+
+    public static L2InteropVerifier L2InteropVerifier { get; } = new();
+
     #endregion
 
     /// <summary>

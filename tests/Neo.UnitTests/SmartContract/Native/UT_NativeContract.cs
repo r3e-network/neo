@@ -107,6 +107,16 @@ public class UT_NativeContract
         Assert.AreEqual(-12, NativeContract.TokenManagement.Id);
         Assert.AreEqual(-13, NativeContract.Governance.Id);
         // NEO token is no longer a native contract, it's managed by Governance through TokenManagement
+        Assert.AreEqual(-101, NativeContract.L2SystemConfig.Id);
+        Assert.AreEqual(-102, NativeContract.L2BatchInfo.Id);
+        Assert.AreEqual(-103, NativeContract.L2Message.Id);
+        Assert.AreEqual(-104, NativeContract.L2Bridge.Id);
+        Assert.AreEqual(-105, NativeContract.L2Fee.Id);
+        Assert.AreEqual(-106, NativeContract.L2Paymaster.Id);
+        Assert.AreEqual(-107, NativeContract.L2NativeExternalBridge.Id);
+        Assert.AreEqual(-108, NativeContract.L2AccountAbstraction.Id);
+        Assert.AreEqual(-109, NativeContract.BridgedNep17.Id);
+        Assert.AreEqual(-110, NativeContract.L2InteropVerifier.Id);
     }
 
     class TestSpecialParameter
@@ -198,8 +208,34 @@ public class UT_NativeContract
         foreach (var ctr in NativeContract.Contracts)
         {
             var state = Call_GetContract(snapshot, ctr.Hash, persistingBlock);
-            Assert.AreEqual(_nativeStates[ctr.Name], state.ToJson().ToString(), message: $"{ctr.Name} is wrong");
+            if (_nativeStates.TryGetValue(ctr.Name, out var expectedState))
+            {
+                Assert.AreEqual(expectedState, state.ToJson().ToString(), message: $"{ctr.Name} is wrong");
+                continue;
+            }
+
+            Assert.IsTrue(IsN4L2NativeContract(ctr), $"{ctr.Name} is not covered by the native state baseline.");
+            Assert.AreEqual(ctr.Id, state.Id, $"{ctr.Name} id is wrong");
+            Assert.AreEqual(ctr.Hash, state.Hash, $"{ctr.Name} hash is wrong");
+            Assert.AreEqual(ctr.Name, state.Manifest.Name, $"{ctr.Name} manifest name is wrong");
+            CollectionAssert.DoesNotContain(state.Manifest.Abi.Methods.Select(p => p.Name).ToArray(), "_deploy", $"{ctr.Name} must be native, not later-deployed.");
+            CollectionAssert.DoesNotContain(state.Manifest.Abi.Methods.Select(p => p.Name).ToArray(), "deploy", $"{ctr.Name} must be native, not later-deployed.");
+            CollectionAssert.DoesNotContain(state.Manifest.Abi.Methods.Select(p => p.Name).ToArray(), "update", $"{ctr.Name} must be native, not later-deployed.");
         }
+    }
+
+    private static bool IsN4L2NativeContract(NativeContract contract)
+    {
+        return contract == NativeContract.L2SystemConfig
+            || contract == NativeContract.L2BatchInfo
+            || contract == NativeContract.L2Message
+            || contract == NativeContract.L2Bridge
+            || contract == NativeContract.L2Fee
+            || contract == NativeContract.L2Paymaster
+            || contract == NativeContract.L2NativeExternalBridge
+            || contract == NativeContract.L2AccountAbstraction
+            || contract == NativeContract.BridgedNep17
+            || contract == NativeContract.L2InteropVerifier;
     }
 
     internal static ContractState Call_GetContract(DataCache snapshot, UInt160 address, Block persistingBlock)
