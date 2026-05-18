@@ -38,7 +38,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubSettlementManager,
             NativeContract.NeoHubDAValidator,
             NativeContract.NeoHubSharedBridge,
-            NativeContract.NeoHubEmergencyManager
+            NativeContract.NeoHubEmergencyManager,
+            NativeContract.NeoHubGovernanceController
         ];
 
         [TestInitialize]
@@ -678,14 +679,178 @@ namespace Neo.UnitTests.SmartContract.Native
                     ArrayParam(Bytes(proofSibling.ToArray())), Integer(0)));
         }
 
-        private static Block Block() => new()
+        [TestMethod]
+        public void GovernanceController_ConfiguresCouncilAdmissionAndApprovedSets()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xf1);
+            var member1 = Key(0x31);
+            var member2 = Key(0x32);
+            var verifier = H(0xf2);
+            var bridge = H(0xf3);
+
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), PublicKeyArray(member1.PublicKey, member2.PublicKey), Integer(2), Integer(2));
+
+            Assert.AreEqual(owner, AsUInt160(NativeContract.NeoHubGovernanceController.Call(snapshot, "getOwner")));
+            Assert.AreEqual(2, NativeContract.NeoHubGovernanceController.Call(snapshot, "getCouncilCount").GetInteger());
+            Assert.AreEqual(2, NativeContract.NeoHubGovernanceController.Call(snapshot, "getThreshold").GetInteger());
+            Assert.AreEqual(2, NativeContract.NeoHubGovernanceController.Call(snapshot, "getTimelockSeconds").GetInteger());
+            Assert.AreEqual(0, NativeContract.NeoHubGovernanceController.Call(snapshot, "getAdmissionMode").GetInteger());
+            Assert.IsTrue(NativeContract.NeoHubGovernanceController.Call(snapshot,
+                "isCouncilMember", PublicKey(member1.PublicKey)).GetBoolean());
+            Assert.IsFalse(NativeContract.NeoHubGovernanceController.Call(snapshot,
+                "isCouncilMember", PublicKey(Key(0x33).PublicKey)).GetBoolean());
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), block,
+                    "setAdmissionMode", Integer(1)));
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setAdmissionMode", Integer(1));
+            Assert.AreEqual(1, NativeContract.NeoHubGovernanceController.Call(snapshot, "getAdmissionMode").GetInteger());
+            Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+                NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                    "setAdmissionMode", Integer(3)));
+
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "approveVerifier", Hash160(verifier));
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "approveBridgeAdapter", Hash160(bridge));
+            Assert.IsTrue(NativeContract.NeoHubGovernanceController.Call(snapshot,
+                "isApprovedVerifier", Hash160(verifier)).GetBoolean());
+            Assert.IsTrue(NativeContract.NeoHubGovernanceController.Call(snapshot,
+                "isApprovedBridgeAdapter", Hash160(bridge)).GetBoolean());
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "revokeVerifier", Hash160(verifier));
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "revokeBridgeAdapter", Hash160(bridge));
+            Assert.IsFalse(NativeContract.NeoHubGovernanceController.Call(snapshot,
+                "isApprovedVerifier", Hash160(verifier)).GetBoolean());
+            Assert.IsFalse(NativeContract.NeoHubGovernanceController.Call(snapshot,
+                "isApprovedBridgeAdapter", Hash160(bridge)).GetBoolean());
+        }
+
+        [TestMethod]
+        public void GovernanceController_ProposalsTimelocksStagesAndImmutableFlags()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xfa);
+            var member1 = Key(0x41);
+            var member2 = Key(0x42);
+            var member1Hash = Contract.CreateSignatureRedeemScript(member1.PublicKey).ToScriptHash();
+            var member2Hash = Contract.CreateSignatureRedeemScript(member2.PublicKey).ToScriptHash();
+            var payload = new byte[] { 0x01, 0x02, 0x03 };
+
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), Block(1000),
+                "configure", Hash160(owner), PublicKeyArray(member1.PublicKey, member2.PublicKey), Integer(2), Integer(2));
+
+            var proposalId = NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(member1Hash), Block(1000),
+                "createProposal", PublicKey(member1.PublicKey), Bytes(payload)).GetInteger();
+            Assert.AreEqual(1, proposalId);
+            CollectionAssert.AreEqual(payload, NativeContract.NeoHubGovernanceController.Call(snapshot,
+                "getProposal", Integer(1)).GetSpan().ToArray());
+
+            Assert.AreEqual(1, NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(member1Hash), Block(1000),
+                "approve", Integer(1), PublicKey(member1.PublicKey)).GetInteger());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(member1Hash), Block(1000),
+                    "approve", Integer(1), PublicKey(member1.PublicKey)));
+            Assert.AreEqual(2, NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(member2Hash), Block(1000),
+                "approve", Integer(1), PublicKey(member2.PublicKey)).GetInteger());
+            Assert.AreEqual(2, NativeContract.NeoHubGovernanceController.Call(snapshot,
+                "getApprovalCount", Integer(1)).GetInteger());
+            Assert.AreEqual(1000, NativeContract.NeoHubGovernanceController.Call(snapshot,
+                "getApprovedAt", Integer(1)).GetInteger());
+
+            Assert.IsFalse(NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(2999),
+                "isApprovedAndTimelocked", Integer(1)).GetBoolean());
+            Assert.IsTrue(NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(3000),
+                "isApprovedAndTimelocked", Integer(1)).GetBoolean());
+            Assert.AreEqual(NeoHubGovernanceControllerContract.StageExecutable, NativeContract.NeoHubGovernanceController.Call(snapshot,
+                new Nep17NativeContractExtensions.ManualWitness(), Block(3000), "getProposalStage", Integer(1)).GetInteger());
+
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(3000),
+                "markProposalExecuted", Integer(1));
+            Assert.AreEqual(3000, NativeContract.NeoHubGovernanceController.Call(snapshot,
+                "getProposalExecutedAt", Integer(1)).GetInteger());
+            Assert.AreEqual(NeoHubGovernanceControllerContract.StageCooldown, NativeContract.NeoHubGovernanceController.Call(snapshot,
+                new Nep17NativeContractExtensions.ManualWitness(), Block(3001), "getProposalStage", Integer(1)).GetInteger());
+            Assert.AreEqual(NeoHubGovernanceControllerContract.StageComplete, NativeContract.NeoHubGovernanceController.Call(snapshot,
+                new Nep17NativeContractExtensions.ManualWitness(), Block(5000), "getProposalStage", Integer(1)).GetInteger());
+
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), Block(5000),
+                "setImmutableFlag", Integer(7));
+            Assert.IsTrue(NativeContract.NeoHubGovernanceController.Call(snapshot, "isImmutable", Integer(7)).GetBoolean());
+
+            var proposal2 = NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(member1Hash), Block(5000),
+                "createProposal", PublicKey(member1.PublicKey), Bytes([0x09])).GetInteger();
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(member1Hash), Block(5000),
+                "approve", Integer((ulong)proposal2), PublicKey(member1.PublicKey));
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(member2Hash), Block(5000),
+                "approve", Integer((ulong)proposal2), PublicKey(member2.PublicKey));
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(6999),
+                    "setImmutableFlagViaProposal", Integer(8), Integer((ulong)proposal2)));
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(7000),
+                "setImmutableFlagViaProposal", Integer(8), Integer((ulong)proposal2));
+            Assert.IsTrue(NativeContract.NeoHubGovernanceController.Call(snapshot, "isImmutable", Integer(8)).GetBoolean());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), Block(7000),
+                    "setImmutableFlagViaProposal", Integer(8), Integer((ulong)proposal2)));
+        }
+
+        [TestMethod]
+        public void GovernanceController_GatesSemiPermissionlessChainRegistration()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xfb);
+            var member = Key(0x51);
+            var verifier = H(0xfc);
+            var bridge = H(0xfd);
+            const uint chainId = 1017;
+            var config = ChainConfig(chainId, securityLevel: 3, daMode: 1, gatewayEnabled: true,
+                permissionlessExit: true, sequencerModel: 1, exitModel: 0, active: true);
+            verifier.ToArray().CopyTo(config, 24);
+            bridge.ToArray().CopyTo(config, 44);
+
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), PublicKeyArray(member.PublicKey), Integer(1), Integer(1));
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setAdmissionMode", Integer(1));
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "approveVerifier", Hash160(verifier));
+
+            NativeContract.NeoHubChainRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner));
+            NativeContract.NeoHubChainRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setGovernanceController", Hash160(NativeContract.NeoHubGovernanceController.Hash));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubChainRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), block,
+                    "registerChainPublic", Integer(chainId), Bytes(config)));
+
+            NativeContract.NeoHubGovernanceController.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "approveBridgeAdapter", Hash160(bridge));
+            NativeContract.NeoHubChainRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(), block,
+                "registerChainPublic", Integer(chainId), Bytes(config));
+
+            Assert.IsTrue(NativeContract.NeoHubChainRegistry.Call(snapshot,
+                "isActive", Integer(chainId)).GetBoolean());
+        }
+
+        private static Block Block(ulong timestamp = 1000) => new()
         {
             Header = new Header
             {
                 PrevHash = UInt256.Zero,
                 MerkleRoot = UInt256.Zero,
                 Index = 100,
-                Timestamp = 1000,
+                Timestamp = timestamp,
                 NextConsensus = UInt160.Zero,
                 Witness = Witness.Empty
             },
@@ -699,6 +864,11 @@ namespace Neo.UnitTests.SmartContract.Native
         private static ContractParameter Hash160(UInt160 value) => new(ContractParameterType.Hash160) { Value = value };
 
         private static ContractParameter Hash256(UInt256 value) => new(ContractParameterType.Hash256) { Value = value };
+
+        private static ContractParameter PublicKey(ECPoint value) => new(ContractParameterType.PublicKey) { Value = value };
+
+        private static ContractParameter PublicKeyArray(params ECPoint[] values) =>
+            new(ContractParameterType.Array) { Value = values.Select(PublicKey).ToList() };
 
         private static ContractParameter Integer(long value) => new(ContractParameterType.Integer) { Value = value };
 

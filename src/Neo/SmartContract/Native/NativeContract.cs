@@ -160,6 +160,11 @@ namespace Neo.SmartContract.Native
         /// </summary>
         public static NeoHubEmergencyManagerContract NeoHubEmergencyManager { get; } = new();
 
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubGovernanceControllerContract"/> class.
+        /// </summary>
+        public static NeoHubGovernanceControllerContract NeoHubGovernanceController { get; } = new();
+
         #endregion
 
         /// <summary>
