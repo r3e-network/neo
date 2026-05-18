@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="430" viewBox="0 0 1180 430" role="img" aria-labelledby="title desc">
+  <title id="title">NeoHub 安全流程</title>
+  <desc id="desc">Forced inclusion、challenge、fraud verification、sequencer slashing 与 emergency control。</desc>
+  <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker><style>.box{fill:#fff;stroke:#334155;stroke-width:2;rx:10}.risk{fill:#fff1f2;stroke:#be123c;stroke-width:2;rx:10}.safe{fill:#ecfdf3;stroke:#16803c;stroke-width:2;rx:10}.gov{fill:#eef6ff;stroke:#2563eb;stroke-width:2;rx:10}.txt{font:15px Arial,"Microsoft YaHei",sans-serif;fill:#111827}.small{font:12px Arial,"Microsoft YaHei",sans-serif;fill:#475569}.title{font:22px Arial,"Microsoft YaHei",sans-serif;font-weight:700;fill:#102a43}.line{stroke:#334155;stroke-width:2;fill:none;marker-end:url(#arrow)}</style></defs>
+  <text x="34" y="38" class="title">抗审查与欺诈恢复</text>
+  <rect x="50" y="88" width="160" height="76" class="box"/><text x="78" y="118" class="txt">用户被审查</text><text x="78" y="142" class="small">交易未被包含</text>
+  <rect x="260" y="88" width="170" height="76" class="safe"/><text x="292" y="118" class="txt">ForcedInclusion</text><text x="286" y="142" class="small">L1 queue + deadline</text>
+  <rect x="480" y="88" width="185" height="76" class="box"/><text x="516" y="118" class="txt">Sequencer set</text><text x="500" y="142" class="small">Registry + Bond</text>
+  <rect x="715" y="88" width="180" height="76" class="risk"/><text x="750" y="118" class="txt">错过 deadline</text><text x="748" y="142" class="small">打开 challenge</text>
+  <rect x="945" y="88" width="180" height="76" class="risk"/><text x="978" y="118" class="txt">OptimisticChallenge</text><text x="982" y="142" class="small">争议 batch</text>
+  <rect x="260" y="245" width="210" height="84" class="box"/><text x="294" y="275" class="txt">Fraud verifiers</text><text x="286" y="299" class="small">Governance v1/v2</text><text x="286" y="319" class="small">Restricted execution v3</text>
+  <rect x="530" y="245" width="185" height="84" class="risk"/><text x="570" y="275" class="txt">Fraud accepted</text><text x="564" y="299" class="small">revert / slash path</text>
+  <rect x="775" y="245" width="185" height="84" class="safe"/><text x="820" y="275" class="txt">Batch 保留</text><text x="820" y="299" class="small">challenge rejected</text>
+  <rect x="50" y="245" width="160" height="84" class="gov"/><text x="80" y="275" class="txt">Emergency</text><text x="74" y="299" class="small">pause, resume, exit</text>
+  <rect x="1000" y="245" width="140" height="84" class="gov"/><text x="1025" y="275" class="txt">Governance</text><text x="1020" y="299" class="small">policy + upgrades</text>
+  <path d="M210 126 L260 126" class="line"/><path d="M430 126 L480 126" class="line"/><path d="M665 126 L715 126" class="line"/><path d="M895 126 L945 126" class="line"/>
+  <path d="M1035 164 C980 230 540 210 470 260" class="line"/><path d="M470 287 L530 287" class="line"/><path d="M715 287 L775 287" class="line"/><path d="M945 287 L960 287" class="line"/><path d="M260 287 L210 287" class="line"/><path d="M1000 287 L960 287" class="line"/>
+  <text x="54" y="392" class="small">正常流程优先 liveness；当假设失败时，安全控制提供 L1 escape、challenge、slash、pause 与 upgrade 路径。</text>
+</svg>
