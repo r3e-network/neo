@@ -155,6 +155,11 @@ namespace Neo.SmartContract.Native
         /// </summary>
         public static NeoHubSharedBridgeContract NeoHubSharedBridge { get; } = new();
 
+        /// <summary>
+        /// Gets the instance of the <see cref="Native.NeoHubEmergencyManagerContract"/> class.
+        /// </summary>
+        public static NeoHubEmergencyManagerContract NeoHubEmergencyManager { get; } = new();
+
         #endregion
 
         /// <summary>

@@ -37,7 +37,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubMessageRouter,
             NativeContract.NeoHubSettlementManager,
             NativeContract.NeoHubDAValidator,
-            NativeContract.NeoHubSharedBridge
+            NativeContract.NeoHubSharedBridge,
+            NativeContract.NeoHubEmergencyManager
         ];
 
         [TestInitialize]
@@ -585,6 +586,96 @@ namespace Neo.UnitTests.SmartContract.Native
                 "isWithdrawalConsumed", Integer(latestChainId), Hash256(latestLeaf)).GetBoolean());
             Assert.IsTrue(NativeContract.NeoHubSharedBridge.Call(snapshot,
                 "isWithdrawalConsumed", Integer(proofChainId), Hash256(proofLeaf)).GetBoolean());
+        }
+
+        [TestMethod]
+        public void EmergencyManager_ConfiguresPauseAndResume()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xd1);
+            var council = H(0xd2);
+            var settlementManager = H(0xd3);
+
+            NativeContract.NeoHubEmergencyManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(council), Hash160(settlementManager));
+
+            Assert.AreEqual(owner, AsUInt160(NativeContract.NeoHubEmergencyManager.Call(snapshot, "getOwner")));
+            Assert.AreEqual(council, AsUInt160(NativeContract.NeoHubEmergencyManager.Call(snapshot, "getEmergencyCouncil")));
+            Assert.AreEqual(settlementManager, AsUInt160(NativeContract.NeoHubEmergencyManager.Call(snapshot, "getSettlementManager")));
+            Assert.IsFalse(NativeContract.NeoHubEmergencyManager.Call(snapshot, "isPaused").GetBoolean());
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubEmergencyManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                    "pause"));
+
+            NativeContract.NeoHubEmergencyManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(council), block,
+                "pause");
+            Assert.IsTrue(NativeContract.NeoHubEmergencyManager.Call(snapshot, "isPaused").GetBoolean());
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                NativeContract.NeoHubEmergencyManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(council), block,
+                    "resume"));
+
+            NativeContract.NeoHubEmergencyManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "resume");
+            Assert.IsFalse(NativeContract.NeoHubEmergencyManager.Call(snapshot, "isPaused").GetBoolean());
+        }
+
+        [TestMethod]
+        public void EmergencyManager_EscapeHatchConsumesCanonicalAndProofLeavesOnlyWhilePaused()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xe1);
+            var council = H(0xe2);
+            var sender = H(0xe3);
+            var otherSender = H(0xe4);
+            const uint singleEntryChainId = 1015;
+            const uint proofChainId = 1016;
+            var singleEntryLeaf = H256(0xe5);
+            var proofLeaf = H256(0xe6);
+            var proofSibling = H256(0xe7);
+
+            NativeContract.NeoHubEmergencyManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(council), Hash160(NativeContract.NeoHubSettlementManager.Hash));
+            snapshot.Add(SettlementKey(0x03, singleEntryChainId), new StorageItem(singleEntryLeaf.ToArray()));
+            snapshot.Add(SettlementKey(0x03, proofChainId), new StorageItem(HashPair(proofLeaf, proofSibling).ToArray()));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                CallAsScript(NativeContract.NeoHubEmergencyManager, snapshot, sender, block,
+                    "escapeHatchExit", Integer(singleEntryChainId), Hash160(sender), Hash256(singleEntryLeaf)));
+
+            NativeContract.NeoHubEmergencyManager.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(council), block,
+                "pause");
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                CallAsScript(NativeContract.NeoHubEmergencyManager, snapshot, otherSender, block,
+                    "escapeHatchExit", Integer(singleEntryChainId), Hash160(sender), Hash256(singleEntryLeaf)));
+
+            CallAsScript(NativeContract.NeoHubEmergencyManager, snapshot, sender, block,
+                "escapeHatchExit", Integer(singleEntryChainId), Hash160(sender), Hash256(singleEntryLeaf));
+            Assert.IsTrue(NativeContract.NeoHubEmergencyManager.Call(snapshot,
+                "isEscapeConsumed", Integer(singleEntryChainId), Hash256(singleEntryLeaf)).GetBoolean());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                CallAsScript(NativeContract.NeoHubEmergencyManager, snapshot, sender, block,
+                    "escapeHatchExit", Integer(singleEntryChainId), Hash160(sender), Hash256(singleEntryLeaf)));
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                CallAsScript(NativeContract.NeoHubEmergencyManager, snapshot, sender, block,
+                    "escapeHatchExitWithProof", Integer(proofChainId), Hash160(sender), Hash256(proofLeaf),
+                    ArrayParam(Bytes(proofSibling.ToArray())), Integer(1)));
+            CallAsScript(NativeContract.NeoHubEmergencyManager, snapshot, sender, block,
+                "escapeHatchExitWithProof", Integer(proofChainId), Hash160(sender), Hash256(proofLeaf),
+                ArrayParam(Bytes(proofSibling.ToArray())), Integer(0));
+            Assert.IsTrue(NativeContract.NeoHubEmergencyManager.Call(snapshot,
+                "isEscapeConsumed", Integer(proofChainId), Hash256(proofLeaf)).GetBoolean());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                CallAsScript(NativeContract.NeoHubEmergencyManager, snapshot, sender, block,
+                    "escapeHatchExitWithProof", Integer(proofChainId), Hash160(sender), Hash256(proofLeaf),
+                    ArrayParam(Bytes(proofSibling.ToArray())), Integer(0)));
         }
 
         private static Block Block() => new()
