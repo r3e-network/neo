@@ -189,5 +189,58 @@ namespace Neo.SmartContract.Native
                 ]
             };
         }
+
+        public ContractEventAttribute(Hardfork activeIn, int order, string name,
+            string arg1Name, ContractParameterType arg1Value,
+            string arg2Name, ContractParameterType arg2Value,
+            string arg3Name, ContractParameterType arg3Value,
+            string arg4Name, ContractParameterType arg4Value,
+            string arg5Name, ContractParameterType arg5Value) : this(order, name, arg1Name, arg1Value, arg2Name, arg2Value, arg3Name, arg3Value, arg4Name, arg4Value, arg5Name, arg5Value)
+        {
+            ActiveIn = activeIn;
+        }
+
+        public ContractEventAttribute(int order, string name,
+            string arg1Name, ContractParameterType arg1Value,
+            string arg2Name, ContractParameterType arg2Value,
+            string arg3Name, ContractParameterType arg3Value,
+            string arg4Name, ContractParameterType arg4Value,
+            string arg5Name, ContractParameterType arg5Value
+            )
+        {
+            Order = order;
+            Descriptor = new ContractEventDescriptor()
+            {
+                Name = name,
+                Parameters =
+                [
+                    new ContractParameterDefinition()
+                    {
+                        Name = arg1Name,
+                        Type = arg1Value
+                    },
+                    new ContractParameterDefinition()
+                    {
+                        Name = arg2Name,
+                        Type = arg2Value
+                    },
+                    new ContractParameterDefinition()
+                    {
+                        Name = arg3Name,
+                        Type = arg3Value
+                    },
+                    new ContractParameterDefinition()
+                    {
+                        Name = arg4Name,
+                        Type = arg4Value
+                    },
+                    new ContractParameterDefinition()
+                    {
+                        Name = arg5Name,
+                        Type = arg5Value
+                    }
+                ]
+            };
+        }
     }
 }

@@ -18,6 +18,7 @@ using Neo.VM.Types;
 using Neo.Wallets;
 using System;
 using System.Linq;
+using System.Numerics;
 
 namespace Neo.UnitTests.SmartContract.Native
 {
@@ -35,7 +36,8 @@ namespace Neo.UnitTests.SmartContract.Native
             NativeContract.NeoHubVerifierRegistry,
             NativeContract.NeoHubMessageRouter,
             NativeContract.NeoHubSettlementManager,
-            NativeContract.NeoHubDAValidator
+            NativeContract.NeoHubDAValidator,
+            NativeContract.NeoHubSharedBridge
         ];
 
         [TestInitialize]
@@ -435,6 +437,156 @@ namespace Neo.UnitTests.SmartContract.Native
                 "verifyWithdrawalLeafWithProof", Integer(chainId), Integer(batchNumber), Hash256(leaf), siblings, Integer(1)).GetBoolean());
         }
 
+        [TestMethod]
+        public void SharedBridge_ConfiguresAndEnqueuesDeposits()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xa1);
+            var settlementManager = H(0xa2);
+            var tokenRegistry = H(0xa3);
+            var sender = H(0xa4);
+            var recipient = H(0xa5);
+            const uint chainId = 1011;
+            const long amount = 123456789;
+            var token = TransferTokenContract();
+
+            snapshot.AddContract(token.Hash, token);
+
+            NativeContract.NeoHubSharedBridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(settlementManager), Hash160(tokenRegistry));
+
+            Assert.AreEqual(owner, AsUInt160(NativeContract.NeoHubSharedBridge.Call(snapshot, "getOwner")));
+            Assert.AreEqual(settlementManager, AsUInt160(NativeContract.NeoHubSharedBridge.Call(snapshot, "getSettlementManager")));
+            Assert.AreEqual(tokenRegistry, AsUInt160(NativeContract.NeoHubSharedBridge.Call(snapshot, "getTokenRegistry")));
+
+            Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+                CallAsScript(NativeContract.NeoHubSharedBridge, snapshot, sender, block,
+                    "deposit", Hash160(token.Hash), Integer(amount), Integer(0), Hash160(recipient)));
+
+            var nonce = CallAsScript(NativeContract.NeoHubSharedBridge, snapshot, sender, block,
+                "deposit", Hash160(token.Hash), Integer(amount), Integer(chainId), Hash160(recipient)).GetInteger();
+
+            Assert.AreEqual(1, nonce);
+            var deposit = NativeContract.NeoHubSharedBridge.Call(snapshot,
+                "getDeposit", Integer(chainId), Integer(1)).GetSpan().ToArray();
+            var amountBytes = new BigInteger(amount).ToByteArray();
+
+            Assert.AreEqual(20 + 20 + 20 + 8 + 4 + amountBytes.Length, deposit.Length);
+            Assert.AreEqual(token.Hash, new UInt160(deposit.AsSpan(0, UInt160.Length)));
+            Assert.AreEqual(recipient, new UInt160(deposit.AsSpan(20, UInt160.Length)));
+            Assert.AreEqual(sender, new UInt160(deposit.AsSpan(40, UInt160.Length)));
+            Assert.AreEqual(1UL, ReadU64(deposit.AsSpan(60)));
+            Assert.AreEqual((uint)amountBytes.Length, ReadU32(deposit.AsSpan(68)));
+            CollectionAssert.AreEqual(amountBytes, deposit.Skip(72).ToArray());
+        }
+
+        [TestMethod]
+        public void SharedBridge_FinalizesWithdrawalsThroughSettlementAndTokenRegistry()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xb1);
+            const uint chainId = 1012;
+            const ulong batchNumber = 2;
+            const ulong withdrawalNonce = 9;
+            const long amount = 987654321;
+            var token = TransferTokenContract();
+            var l2Asset = H(0xb2);
+            var emittingContract = H(0xb3);
+            var l2Sender = H(0xb4);
+            var recipient = H(0xb5);
+            var caller = H(0xb6);
+            var leaf = ComputeWithdrawalLeafHash(
+                emittingContract, l2Sender, recipient, l2Asset, new BigInteger(amount), withdrawalNonce);
+
+            snapshot.AddContract(token.Hash, token);
+            NativeContract.NeoHubTokenRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner));
+            NativeContract.NeoHubTokenRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerMapping", Bytes(AssetMapping(token.Hash, chainId, l2Asset, active: true)));
+            NativeContract.NeoHubSharedBridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(NativeContract.NeoHubSettlementManager.Hash),
+                Hash160(NativeContract.NeoHubTokenRegistry.Hash));
+            snapshot.Add(SettlementKey(0x01, chainId, batchNumber), new StorageItem([NeoHubSettlementManagerContract.StatusFinalized]));
+            snapshot.Add(SettlementKey(0x05, chainId, batchNumber), new StorageItem(leaf.ToArray()));
+
+            CallAsScript(NativeContract.NeoHubSharedBridge, snapshot, caller, block,
+                "finalizeWithdrawalAt", Integer(chainId), Integer(batchNumber), Hash256(leaf),
+                Hash160(emittingContract), Hash160(l2Sender), Hash160(l2Asset), Integer(withdrawalNonce),
+                Hash160(token.Hash), Hash160(recipient), Integer(amount));
+
+            Assert.IsTrue(NativeContract.NeoHubSharedBridge.Call(snapshot,
+                "isWithdrawalConsumed", Integer(chainId), Hash256(leaf)).GetBoolean());
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                CallAsScript(NativeContract.NeoHubSharedBridge, snapshot, caller, block,
+                    "finalizeWithdrawalAt", Integer(chainId), Integer(batchNumber), Hash256(leaf),
+                    Hash160(emittingContract), Hash160(l2Sender), Hash160(l2Asset), Integer(withdrawalNonce),
+                    Hash160(token.Hash), Hash160(recipient), Integer(amount)));
+        }
+
+        [TestMethod]
+        public void SharedBridge_FinalizesLatestAndMerkleProofWithdrawals()
+        {
+            var snapshot = _snapshotCache.CloneCache();
+            var block = Block();
+            var committee = NativeContract.NEO.GetCommitteeAddress(snapshot);
+            var owner = H(0xc1);
+            const uint latestChainId = 1013;
+            const uint proofChainId = 1014;
+            const ulong latestBatch = 3;
+            const ulong proofBatch = 4;
+            const long latestAmount = 1234;
+            const long proofAmount = 5678;
+            var token = TransferTokenContract();
+            var l2Asset = H(0xc2);
+            var emittingContract = H(0xc3);
+            var l2Sender = H(0xc4);
+            var latestRecipient = H(0xc5);
+            var proofRecipient = H(0xc6);
+            var caller = H(0xc7);
+            var latestLeaf = ComputeWithdrawalLeafHash(
+                emittingContract, l2Sender, latestRecipient, l2Asset, new BigInteger(latestAmount), 1);
+            var proofLeaf = ComputeWithdrawalLeafHash(
+                emittingContract, l2Sender, proofRecipient, l2Asset, new BigInteger(proofAmount), 2);
+            var proofSibling = H256(0xc8);
+
+            snapshot.AddContract(token.Hash, token);
+            NativeContract.NeoHubTokenRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner));
+            NativeContract.NeoHubTokenRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerMapping", Bytes(AssetMapping(token.Hash, latestChainId, l2Asset, active: true)));
+            NativeContract.NeoHubTokenRegistry.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerMapping", Bytes(AssetMapping(token.Hash, proofChainId, l2Asset, active: true)));
+            NativeContract.NeoHubSharedBridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "configure", Hash160(owner), Hash160(NativeContract.NeoHubSettlementManager.Hash),
+                Hash160(NativeContract.NeoHubTokenRegistry.Hash));
+
+            snapshot.Add(SettlementKey(0x01, latestChainId, latestBatch), new StorageItem([NeoHubSettlementManagerContract.StatusFinalized]));
+            snapshot.Add(SettlementKey(0x05, latestChainId, latestBatch), new StorageItem(latestLeaf.ToArray()));
+            snapshot.Add(SettlementKey(0x04, latestChainId), new StorageItem(new BigInteger(latestBatch)));
+            snapshot.Add(SettlementKey(0x01, proofChainId, proofBatch), new StorageItem([NeoHubSettlementManagerContract.StatusFinalized]));
+            snapshot.Add(SettlementKey(0x05, proofChainId, proofBatch), new StorageItem(HashPair(proofLeaf, proofSibling).ToArray()));
+
+            CallAsScript(NativeContract.NeoHubSharedBridge, snapshot, caller, block,
+                "finalizeWithdrawal", Integer(latestChainId), Hash256(latestLeaf),
+                Hash160(emittingContract), Hash160(l2Sender), Hash160(l2Asset), Integer(1),
+                Hash160(token.Hash), Hash160(latestRecipient), Integer(latestAmount));
+
+            CallAsScript(NativeContract.NeoHubSharedBridge, snapshot, caller, block,
+                "finalizeWithdrawalWithProof", Integer(proofChainId), Integer(proofBatch), Hash256(proofLeaf),
+                ArrayParam(Bytes(proofSibling.ToArray())), Integer(0),
+                Hash160(emittingContract), Hash160(l2Sender), Hash160(l2Asset), Integer(2),
+                Hash160(token.Hash), Hash160(proofRecipient), Integer(proofAmount));
+
+            Assert.IsTrue(NativeContract.NeoHubSharedBridge.Call(snapshot,
+                "isWithdrawalConsumed", Integer(latestChainId), Hash256(latestLeaf)).GetBoolean());
+            Assert.IsTrue(NativeContract.NeoHubSharedBridge.Call(snapshot,
+                "isWithdrawalConsumed", Integer(proofChainId), Hash256(proofLeaf)).GetBoolean());
+        }
+
         private static Block Block() => new()
         {
             Header = new Header
@@ -564,6 +716,38 @@ namespace Neo.UnitTests.SmartContract.Native
             return Neo.UnitTests.TestUtils.GetContract(script.ToArray(), manifest);
         }
 
+        private static ContractState TransferTokenContract()
+        {
+            using var script = new ScriptBuilder();
+            script.Emit(OpCode.DROP);
+            script.Emit(OpCode.DROP);
+            script.Emit(OpCode.DROP);
+            script.Emit(OpCode.DROP);
+            script.EmitPush(true);
+            script.Emit(OpCode.RET);
+
+            var manifest = Neo.UnitTests.TestUtils.CreateDefaultManifest();
+            manifest.Name = "NeoHubTransferToken";
+            manifest.Abi.Methods =
+            [
+                new ContractMethodDescriptor
+                {
+                    Name = "transfer",
+                    Parameters =
+                    [
+                        new ContractParameterDefinition { Name = "from", Type = ContractParameterType.Hash160 },
+                        new ContractParameterDefinition { Name = "to", Type = ContractParameterType.Hash160 },
+                        new ContractParameterDefinition { Name = "amount", Type = ContractParameterType.Integer },
+                        new ContractParameterDefinition { Name = "data", Type = ContractParameterType.Any }
+                    ],
+                    ReturnType = ContractParameterType.Boolean,
+                    Offset = 0,
+                    Safe = false
+                }
+            ];
+            return Neo.UnitTests.TestUtils.GetContract(script.ToArray(), manifest);
+        }
+
         private static StackItem CallAsScript(
             NativeContract contract,
             DataCache snapshot,
@@ -659,12 +843,74 @@ namespace Neo.UnitTests.SmartContract.Native
             return StorageKey.Create(NativeContract.NeoHubSettlementManager.Id, prefix, key);
         }
 
+        private static StorageKey SettlementKey(byte prefix, uint chainId)
+        {
+            var key = new byte[4];
+            WriteU32(key, 0, chainId);
+            return StorageKey.Create(NativeContract.NeoHubSettlementManager.Id, prefix, key);
+        }
+
         private static UInt256 HashPair(UInt256 left, UInt256 right)
         {
             var bytes = new byte[UInt256.Length * 2];
             left.ToArray().CopyTo(bytes, 0);
             right.ToArray().CopyTo(bytes, UInt256.Length);
             return new UInt256(Crypto.Hash256(bytes));
+        }
+
+        private static UInt256 ComputeWithdrawalLeafHash(
+            UInt160 emittingContract,
+            UInt160 l2Sender,
+            UInt160 l1Recipient,
+            UInt160 l2Asset,
+            BigInteger amount,
+            ulong nonce)
+        {
+            var amountBytes = ToUnsignedLittleEndian(amount);
+            var bytes = new byte[20 + 20 + 20 + 20 + 4 + amountBytes.Length + 8];
+            var offset = 0;
+            emittingContract.ToArray().CopyTo(bytes, offset);
+            offset += UInt160.Length;
+            l2Sender.ToArray().CopyTo(bytes, offset);
+            offset += UInt160.Length;
+            l1Recipient.ToArray().CopyTo(bytes, offset);
+            offset += UInt160.Length;
+            l2Asset.ToArray().CopyTo(bytes, offset);
+            offset += UInt160.Length;
+            WriteU32(bytes, offset, (uint)amountBytes.Length);
+            offset += 4;
+            amountBytes.CopyTo(bytes, offset);
+            offset += amountBytes.Length;
+            WriteU64(bytes, offset, nonce);
+            return new UInt256(Crypto.Hash256(bytes));
+        }
+
+        private static byte[] ToUnsignedLittleEndian(BigInteger value)
+        {
+            var raw = value.ToByteArray();
+            var length = raw.Length;
+            while (length > 1 && raw[length - 1] == 0) length--;
+            return raw.Take(length).ToArray();
+        }
+
+        private static uint ReadU32(ReadOnlySpan<byte> bytes)
+        {
+            return bytes[0]
+                | ((uint)bytes[1] << 8)
+                | ((uint)bytes[2] << 16)
+                | ((uint)bytes[3] << 24);
+        }
+
+        private static ulong ReadU64(ReadOnlySpan<byte> bytes)
+        {
+            return bytes[0]
+                | ((ulong)bytes[1] << 8)
+                | ((ulong)bytes[2] << 16)
+                | ((ulong)bytes[3] << 24)
+                | ((ulong)bytes[4] << 32)
+                | ((ulong)bytes[5] << 40)
+                | ((ulong)bytes[6] << 48)
+                | ((ulong)bytes[7] << 56);
         }
 
         private static void WriteU32(byte[] bytes, int offset, uint value)
