@@ -263,10 +263,7 @@ namespace Neo.UnitTests.SmartContract.Native
                 var state = Call_GetContract(snapshot, ctr.Hash, persistingBlock);
                 if (!_nativeStates.TryGetValue(ctr.Name, out var expectedState))
                 {
-                    Assert.IsInstanceOfType<NeoHubNativeContract>(ctr,
-                        $"{ctr.Name} must have a genesis native-state fixture unless it is an r3e NeoHub native contract.");
-                    Assert.IsTrue(NativeContract.IsNative(ctr.Hash));
-                    continue;
+                    Assert.Fail($"{ctr.Name} must have a genesis native-state fixture.");
                 }
                 Assert.AreEqual(expectedState, state.ToJson().ToString(), message: $"{ctr.Name} is wrong");
             }
