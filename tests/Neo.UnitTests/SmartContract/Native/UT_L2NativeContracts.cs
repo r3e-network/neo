@@ -58,20 +58,27 @@ public class UT_L2NativeContracts
     }
 
     [TestMethod]
-    public void BridgedNep17_InitializesPlatformNeoTokenAtGenesis()
+    public void BridgedNep17_InitializesPlatformTokensAtGenesis()
     {
         var snapshot = TestBlockchain.GetTestSnapshotCache().CloneCache();
-        var l2Neo = NativeContract.BridgedNep17.L2NeoTokenId;
-        var token = NativeContract.TokenManagement.GetTokenInfo(snapshot, l2Neo);
 
-        Assert.IsNotNull(token, "Every N4 L2 must expose built-in decimalized NEO metadata at genesis.");
-        Assert.AreEqual(TokenType.Fungible, token.Type);
-        Assert.AreEqual(NativeContract.BridgedNep17.Hash, token.Owner);
-        Assert.AreEqual("NEO", token.Name);
-        Assert.AreEqual("NEO", token.Symbol);
-        Assert.AreEqual((byte)8, token.Decimals);
-        Assert.AreEqual(BigInteger.Zero, token.TotalSupply);
-        Assert.AreEqual(BigInteger.Parse("10000000000000000"), token.MaxSupply);
+        AssertPlatformToken(NativeContract.BridgedNep17.L2NeoTokenId, "NEO", "NEO", 8, BigInteger.Parse("10000000000000000"));
+        AssertPlatformToken(TokenManagement.GetAssetId(NativeContract.BridgedNep17.Hash, "USDT"), "USDT", "USDT", 6, BigInteger.MinusOne);
+        AssertPlatformToken(TokenManagement.GetAssetId(NativeContract.BridgedNep17.Hash, "USDC"), "USDC", "USDC", 6, BigInteger.MinusOne);
+        AssertPlatformToken(TokenManagement.GetAssetId(NativeContract.BridgedNep17.Hash, "BTC"), "BTC", "BTC", 8, BigInteger.Parse("2100000000000000"));
+
+        void AssertPlatformToken(UInt160 assetId, string name, string symbol, byte decimals, BigInteger maxSupply)
+        {
+            var token = NativeContract.TokenManagement.GetTokenInfo(snapshot, assetId);
+            Assert.IsNotNull(token, $"Every N4 L2 must expose built-in {symbol} metadata at genesis.");
+            Assert.AreEqual(TokenType.Fungible, token.Type);
+            Assert.AreEqual(NativeContract.BridgedNep17.Hash, token.Owner);
+            Assert.AreEqual(name, token.Name);
+            Assert.AreEqual(symbol, token.Symbol);
+            Assert.AreEqual(decimals, token.Decimals);
+            Assert.AreEqual(BigInteger.Zero, token.TotalSupply);
+            Assert.AreEqual(maxSupply, token.MaxSupply);
+        }
     }
 
     [TestMethod]
@@ -216,6 +223,12 @@ public class UT_L2NativeContracts
         var systemAccount = UInt160.Parse("0x0202020202020202020202020202020202020202");
         var l1Gas = UInt160.Parse("0x0808080808080808080808080808080808080808");
         var l1Neo = UInt160.Parse("0x0909090909090909090909090909090909090909");
+        var l1Usdt = UInt160.Parse("0x0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a");
+        var l1Usdc = UInt160.Parse("0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+        var l1Btc = UInt160.Parse("0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c");
+        var l2Usdt = TokenManagement.GetAssetId(NativeContract.BridgedNep17.Hash, "USDT");
+        var l2Usdc = TokenManagement.GetAssetId(NativeContract.BridgedNep17.Hash, "USDC");
+        var l2Btc = TokenManagement.GetAssetId(NativeContract.BridgedNep17.Hash, "BTC");
 
         NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
             "configure", Hash160(owner), Hash160(systemAccount));
@@ -227,6 +240,18 @@ public class UT_L2NativeContracts
         Assert.ThrowsExactly<InvalidOperationException>(() =>
             NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
                 "registerMapping", Hash160(l1Neo), Hash160(NativeContract.BridgedNep17.L2NeoTokenId), Integer(8), Integer(8)));
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerMapping", Hash160(l1Usdt), Hash160(l2Usdt), Integer(8), Integer(8)));
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerMapping", Hash160(l1Usdc), Hash160(l2Usdc), Integer(6), Integer(8)));
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerMapping", Hash160(l1Btc), Hash160(l2Btc), Integer(6), Integer(6)));
     }
 
     [TestMethod]

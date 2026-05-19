@@ -438,6 +438,25 @@ public sealed class L2BridgeContract : L2NativeContract
         if (l2Asset == NativeContract.BridgedNep17.L2NeoTokenId &&
             (l1Decimals != Governance.NeoTokenDecimals || l2Decimals != BridgedNep17Contract.PlatformNeoDecimals))
             throw new InvalidOperationException("NEO mapping must convert L1 0 decimals to L2 8 decimals");
+        ValidateFixedPlatformMapping(l2Asset, NativeContract.BridgedNep17.L2UsdtTokenId, l1Decimals, l2Decimals,
+            BridgedNep17Contract.PlatformUsdtDecimals, BridgedNep17Contract.PlatformUsdtDecimals, "USDT");
+        ValidateFixedPlatformMapping(l2Asset, NativeContract.BridgedNep17.L2UsdcTokenId, l1Decimals, l2Decimals,
+            BridgedNep17Contract.PlatformUsdcDecimals, BridgedNep17Contract.PlatformUsdcDecimals, "USDC");
+        ValidateFixedPlatformMapping(l2Asset, NativeContract.BridgedNep17.L2BtcTokenId, l1Decimals, l2Decimals,
+            BridgedNep17Contract.PlatformBtcDecimals, BridgedNep17Contract.PlatformBtcDecimals, "BTC");
+    }
+
+    private static void ValidateFixedPlatformMapping(
+        UInt160 l2Asset,
+        UInt160 expectedAsset,
+        byte l1Decimals,
+        byte l2Decimals,
+        byte expectedL1Decimals,
+        byte expectedL2Decimals,
+        string symbol)
+    {
+        if (l2Asset == expectedAsset && (l1Decimals != expectedL1Decimals || l2Decimals != expectedL2Decimals))
+            throw new InvalidOperationException($"{symbol} mapping must use {expectedL1Decimals} decimals on L1 and {expectedL2Decimals} decimals on L2");
     }
 
     private static BigInteger ScaleAmount(BigInteger amount, byte fromDecimals, byte toDecimals)
@@ -837,6 +856,17 @@ public sealed class BridgedNep17Contract : L2NativeContract
     public const string PlatformNeoSymbol = "NEO";
     public const byte PlatformNeoDecimals = 8;
     private static readonly BigInteger PlatformNeoMaxSupply = Governance.NeoTokenTotalAmount * BigInteger.Pow(10, PlatformNeoDecimals - Governance.NeoTokenDecimals);
+    public const string PlatformUsdtName = "USDT";
+    public const string PlatformUsdtSymbol = "USDT";
+    public const byte PlatformUsdtDecimals = 6;
+    public const string PlatformUsdcName = "USDC";
+    public const string PlatformUsdcSymbol = "USDC";
+    public const byte PlatformUsdcDecimals = 6;
+    public const string PlatformBtcName = "BTC";
+    public const string PlatformBtcSymbol = "BTC";
+    public const byte PlatformBtcDecimals = 8;
+    private static readonly BigInteger PlatformUnlimitedMaxSupply = BigInteger.MinusOne;
+    private static readonly BigInteger PlatformBtcMaxSupply = new BigInteger(21_000_000) * BigInteger.Pow(10, PlatformBtcDecimals);
     private const byte PrefixL1ToL2 = 0x01;
     private const byte PrefixL2ToL1 = 0x02;
     private const byte PrefixAuthorizedBridge = 0x03;
@@ -846,11 +876,19 @@ public sealed class BridgedNep17Contract : L2NativeContract
     internal BridgedNep17Contract() : base(-109) { }
 
     public UInt160 L2NeoTokenId => field ??= TokenManagement.GetAssetId(Hash, PlatformNeoName);
+    public UInt160 L2UsdtTokenId => field ??= TokenManagement.GetAssetId(Hash, PlatformUsdtName);
+    public UInt160 L2UsdcTokenId => field ??= TokenManagement.GetAssetId(Hash, PlatformUsdcName);
+    public UInt160 L2BtcTokenId => field ??= TokenManagement.GetAssetId(Hash, PlatformBtcName);
 
     internal override ContractTask InitializeAsync(ApplicationEngine engine, Hardfork? hardfork)
     {
-        if (hardfork == ActiveIn && NativeContract.TokenManagement.GetTokenInfo(engine.SnapshotCache, L2NeoTokenId) is null)
-            NativeContract.TokenManagement.CreateInternal(engine, Hash, PlatformNeoName, PlatformNeoSymbol, PlatformNeoDecimals, PlatformNeoMaxSupply);
+        if (hardfork == ActiveIn)
+        {
+            EnsurePlatformToken(engine, L2NeoTokenId, PlatformNeoName, PlatformNeoSymbol, PlatformNeoDecimals, PlatformNeoMaxSupply);
+            EnsurePlatformToken(engine, L2UsdtTokenId, PlatformUsdtName, PlatformUsdtSymbol, PlatformUsdtDecimals, PlatformUnlimitedMaxSupply);
+            EnsurePlatformToken(engine, L2UsdcTokenId, PlatformUsdcName, PlatformUsdcSymbol, PlatformUsdcDecimals, PlatformUnlimitedMaxSupply);
+            EnsurePlatformToken(engine, L2BtcTokenId, PlatformBtcName, PlatformBtcSymbol, PlatformBtcDecimals, PlatformBtcMaxSupply);
+        }
         return ContractTask.CompletedTask;
     }
 
@@ -933,6 +971,19 @@ public sealed class BridgedNep17Contract : L2NativeContract
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
     public UInt160 GetL1Asset(IReadOnlyStore snapshot, UInt160 l2Asset) => ReadUInt160(snapshot, Key(PrefixL2ToL1, l2Asset));
+
+    private void EnsurePlatformToken(ApplicationEngine engine, UInt160 assetId, string name, string symbol, byte decimals, BigInteger maxSupply)
+    {
+        var token = NativeContract.TokenManagement.GetTokenInfo(engine.SnapshotCache, assetId);
+        if (token is null)
+        {
+            NativeContract.TokenManagement.CreateInternal(engine, Hash, name, symbol, decimals, maxSupply);
+            return;
+        }
+        if (token.Type != TokenType.Fungible || token.Owner != Hash || token.Name != name || token.Symbol != symbol ||
+            token.Decimals != decimals || token.MaxSupply != maxSupply)
+            throw new InvalidOperationException($"{symbol} platform token metadata mismatch");
+    }
 
     [ContractMethod(CpuFee = 1 << 17, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States | CallFlags.AllowNotify)]
     private async ContractTask Mint(ApplicationEngine engine, UInt160 assetId, UInt160 to, BigInteger amount)
