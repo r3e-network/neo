@@ -257,7 +257,7 @@ public sealed class L2BatchInfoContract : L2NativeContract
     }
 }
 
-[ContractEvent(0, name: "MessageEmitted", "sourceChainId", ContractParameterType.Integer, "targetChainId", ContractParameterType.Integer, "nonce", ContractParameterType.Integer, "sender", ContractParameterType.Hash160, "receiver", ContractParameterType.Hash160, "messageType", ContractParameterType.Integer)]
+[ContractEvent(0, name: "MessageEmitted", "sourceChainId", ContractParameterType.Integer, "targetChainId", ContractParameterType.Integer, "nonce", ContractParameterType.Integer, "sender", ContractParameterType.Hash160, "receiver", ContractParameterType.Hash160, "messageType", ContractParameterType.Integer, "payload", ContractParameterType.ByteArray)]
 [ContractEvent(1, name: "InboundApplied", "sourceChainId", ContractParameterType.Integer, "nonce", ContractParameterType.Integer, "receiver", ContractParameterType.Hash160)]
 public sealed class L2MessageContract : L2NativeContract
 {
@@ -291,7 +291,11 @@ public sealed class L2MessageContract : L2NativeContract
         if (targetChainId == GetChainId(engine.SnapshotCache)) throw new InvalidOperationException("self-targeted message");
         var sender = CallingScriptHash(engine);
         var nonce = NextNonce(engine.SnapshotCache, sender);
-        Notify(engine, "MessageEmitted", GetChainId(engine.SnapshotCache), targetChainId, nonce, sender, receiver, messageType);
+        // Emit the full message in the event so light clients + cross-chain indexers
+        // can reconstruct the canonical message hash without needing tx-trace access.
+        // The L2 native contract takes payload as a parameter; passing it through to
+        // the event keeps the event self-contained and matches the OP/zkSync pattern.
+        Notify(engine, "MessageEmitted", GetChainId(engine.SnapshotCache), targetChainId, nonce, sender, receiver, messageType, payload);
         return nonce;
     }
 
