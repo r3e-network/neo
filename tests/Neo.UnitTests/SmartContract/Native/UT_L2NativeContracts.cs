@@ -58,6 +58,48 @@ public class UT_L2NativeContracts
     }
 
     [TestMethod]
+    public void BridgedNep17_InitializesPlatformNeoTokenAtGenesis()
+    {
+        var snapshot = TestBlockchain.GetTestSnapshotCache().CloneCache();
+        var l2Neo = NativeContract.BridgedNep17.L2NeoTokenId;
+        var token = NativeContract.TokenManagement.GetTokenInfo(snapshot, l2Neo);
+
+        Assert.IsNotNull(token, "Every N4 L2 must expose built-in decimalized NEO metadata at genesis.");
+        Assert.AreEqual(TokenType.Fungible, token.Type);
+        Assert.AreEqual(NativeContract.BridgedNep17.Hash, token.Owner);
+        Assert.AreEqual("NEO", token.Name);
+        Assert.AreEqual("NEO", token.Symbol);
+        Assert.AreEqual((byte)8, token.Decimals);
+        Assert.AreEqual(BigInteger.Zero, token.TotalSupply);
+        Assert.AreEqual(BigInteger.Parse("10000000000000000"), token.MaxSupply);
+    }
+
+    [TestMethod]
+    public void L2MappedNeo_UsesDecimalizedNativeBridgeMetadata()
+    {
+        var snapshot = TestBlockchain.GetTestSnapshotCache().CloneCache();
+        var block = CreatePersistingBlock();
+        var committee = NativeContract.Governance.GetCommitteeAddress(snapshot);
+        var owner = UInt160.Parse("0x0101010101010101010101010101010101010101");
+        var l1Neo = UInt160.Parse("0x0909090909090909090909090909090909090909");
+
+        NativeContract.BridgedNep17.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+            "configure", Hash160(owner), Hash160(NativeContract.L2Bridge.Hash));
+        var asset = (ByteString)NativeContract.BridgedNep17.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+            "createBridgedToken", Text("NEO"), Text("NEO"), Integer(8), Hash160(l1Neo), Integer(BigInteger.Parse("10000000000000000")))!;
+        var l2Neo = new UInt160(asset.GetSpan());
+        var neo = NativeContract.TokenManagement.GetTokenInfo(snapshot, l2Neo)!;
+        var gas = NativeContract.TokenManagement.GetTokenInfo(snapshot, NativeContract.Governance.GasTokenId)!;
+
+        Assert.AreEqual(NativeContract.BridgedNep17.L2NeoTokenId, l2Neo);
+        Assert.AreEqual(l1Neo, NativeContract.BridgedNep17.GetL1Asset(snapshot, l2Neo));
+        Assert.AreEqual((byte)0, Governance.NeoTokenDecimals);
+        Assert.AreEqual((byte)8, Governance.GasTokenDecimals);
+        Assert.AreEqual((byte)8, neo.Decimals);
+        Assert.AreEqual((byte)8, gas.Decimals);
+    }
+
+    [TestMethod]
     public void L2BatchInfo_UsesNativeAuthorizationAndStorage()
     {
         var snapshot = TestBlockchain.GetTestSnapshotCache().CloneCache();
@@ -114,7 +156,7 @@ public class UT_L2NativeContracts
         var l2Asset = new UInt160(asset.GetSpan());
 
         NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
-            "registerMapping", Hash160(l1Asset), Hash160(l2Asset));
+            "registerMapping", Hash160(l1Asset), Hash160(l2Asset), Integer(8), Integer(8));
         NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(systemAccount), block,
             "applyDeposit", Integer(0), Integer(1), Hash160(l1Asset), Hash160(l2User), Integer(100));
 
@@ -125,6 +167,66 @@ public class UT_L2NativeContracts
 
         Assert.AreEqual(60, BalanceOf(snapshot, l2Asset, l2User));
         Assert.AreEqual(60, NativeContract.TokenManagement.GetTokenInfo(snapshot, l2Asset)!.TotalSupply);
+    }
+
+    [TestMethod]
+    public void L2Bridge_ConvertsBetweenIndivisibleL1NeoAndDecimalizedL2Mapping()
+    {
+        var snapshot = TestBlockchain.GetTestSnapshotCache().CloneCache();
+        var block = CreatePersistingBlock();
+        var committee = NativeContract.Governance.GetCommitteeAddress(snapshot);
+        var owner = UInt160.Parse("0x0101010101010101010101010101010101010101");
+        var systemAccount = UInt160.Parse("0x0202020202020202020202020202020202020202");
+        var l1Neo = UInt160.Parse("0x0909090909090909090909090909090909090909");
+        var l1Recipient = UInt160.Parse("0x0404040404040404040404040404040404040404");
+        var l2User = UInt160.Parse("0x0505050505050505050505050505050505050505");
+
+        NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+            "configure", Hash160(owner), Hash160(systemAccount));
+        NativeContract.BridgedNep17.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+            "configure", Hash160(owner), Hash160(NativeContract.L2Bridge.Hash));
+        var asset = (ByteString)NativeContract.BridgedNep17.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+            "createBridgedToken", Text("NEO"), Text("NEO"), Integer(8), Hash160(l1Neo), Integer(BigInteger.Parse("10000000000000000")))!;
+        var l2Neo = new UInt160(asset.GetSpan());
+        NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+            "registerMapping", Hash160(l1Neo), Hash160(l2Neo), Integer(0), Integer(8));
+
+        NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(systemAccount), block,
+            "applyDeposit", Integer(0), Integer(1), Hash160(l1Neo), Hash160(l2User), Integer(2));
+
+        Assert.AreEqual(new BigInteger(200_000_000), BalanceOf(snapshot, l2Neo, l2User));
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            CallAsScript(NativeContract.L2Bridge, snapshot, l2User, new Nep17NativeContractExtensions.ManualWitness(l2User), block,
+                "initiateWithdrawal", Hash160(l2Neo), Integer(1), Hash160(l1Recipient)));
+
+        CallAsScript(NativeContract.L2Bridge, snapshot, l2User, new Nep17NativeContractExtensions.ManualWitness(l2User), block,
+            "initiateWithdrawal", Hash160(l2Neo), Integer(100_000_000), Hash160(l1Recipient));
+
+        Assert.AreEqual(new BigInteger(100_000_000), BalanceOf(snapshot, l2Neo, l2User));
+    }
+
+    [TestMethod]
+    public void L2Bridge_RejectsWrongPlatformDecimals()
+    {
+        var snapshot = TestBlockchain.GetTestSnapshotCache().CloneCache();
+        var block = CreatePersistingBlock();
+        var committee = NativeContract.Governance.GetCommitteeAddress(snapshot);
+        var owner = UInt160.Parse("0x0101010101010101010101010101010101010101");
+        var systemAccount = UInt160.Parse("0x0202020202020202020202020202020202020202");
+        var l1Gas = UInt160.Parse("0x0808080808080808080808080808080808080808");
+        var l1Neo = UInt160.Parse("0x0909090909090909090909090909090909090909");
+
+        NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+            "configure", Hash160(owner), Hash160(systemAccount));
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerMapping", Hash160(l1Gas), Hash160(NativeContract.Governance.GasTokenId), Integer(0), Integer(8)));
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2Bridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "registerMapping", Hash160(l1Neo), Hash160(NativeContract.BridgedNep17.L2NeoTokenId), Integer(8), Integer(8)));
     }
 
     [TestMethod]

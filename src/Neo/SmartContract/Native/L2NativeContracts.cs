@@ -326,6 +326,8 @@ public sealed class L2BridgeContract : L2NativeContract
     private const byte PrefixMapping = 0x01;
     private const byte PrefixDepositConsumed = 0x02;
     private const byte PrefixWithdrawalNonce = 0x03;
+    private const byte PrefixMappingByL2 = 0x04;
+    private const byte MaxTokenDecimals = 18;
     private const byte KeySystemAccount = 0xfe;
     private const byte KeyOwner = 0xff;
 
@@ -342,16 +344,40 @@ public sealed class L2BridgeContract : L2NativeContract
     }
 
     [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States)]
-    private void RegisterMapping(ApplicationEngine engine, UInt160 l1Asset, UInt160 l2Asset)
+    private void RegisterMapping(ApplicationEngine engine, UInt160 l1Asset, UInt160 l2Asset, byte l1Decimals, byte l2Decimals)
     {
         AssertOwnerOrCommittee(engine, KeyOwner);
         RequireNonZero(l1Asset, nameof(l1Asset));
         RequireNonZero(l2Asset, nameof(l2Asset));
-        engine.SnapshotCache.GetAndChange(Key(PrefixMapping, l1Asset), () => new StorageItem(l2Asset.ToArray())).Value = l2Asset.ToArray();
+        ValidateDecimals(l1Decimals, nameof(l1Decimals));
+        ValidateDecimals(l2Decimals, nameof(l2Decimals));
+        ValidatePlatformMapping(l2Asset, l1Decimals, l2Decimals);
+
+        var oldByL1 = ReadMapping(engine.SnapshotCache, Key(PrefixMapping, l1Asset));
+        if (oldByL1.Asset != UInt160.Zero && oldByL1.Asset != l2Asset)
+            engine.SnapshotCache.Delete(Key(PrefixMappingByL2, oldByL1.Asset));
+
+        var oldByL2 = ReadMapping(engine.SnapshotCache, Key(PrefixMappingByL2, l2Asset));
+        if (oldByL2.Asset != UInt160.Zero && oldByL2.Asset != l1Asset)
+            engine.SnapshotCache.Delete(Key(PrefixMapping, oldByL2.Asset));
+
+        engine.SnapshotCache.GetAndChange(Key(PrefixMapping, l1Asset), () => new StorageItem()).Value =
+            EncodeMapping(l2Asset, l1Decimals, l2Decimals);
+        engine.SnapshotCache.GetAndChange(Key(PrefixMappingByL2, l2Asset), () => new StorageItem()).Value =
+            EncodeMapping(l1Asset, l1Decimals, l2Decimals);
     }
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
-    public UInt160 GetL2Asset(IReadOnlyStore snapshot, UInt160 l1Asset) => ReadUInt160(snapshot, Key(PrefixMapping, l1Asset));
+    public UInt160 GetL2Asset(IReadOnlyStore snapshot, UInt160 l1Asset) => ReadMapping(snapshot, Key(PrefixMapping, l1Asset)).Asset;
+
+    [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
+    public UInt160 GetL1Asset(IReadOnlyStore snapshot, UInt160 l2Asset) => ReadMapping(snapshot, Key(PrefixMappingByL2, l2Asset)).Asset;
+
+    [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
+    public byte GetL1Decimals(IReadOnlyStore snapshot, UInt160 l1Asset) => ReadMapping(snapshot, Key(PrefixMapping, l1Asset)).L1Decimals;
+
+    [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
+    public byte GetL2Decimals(IReadOnlyStore snapshot, UInt160 l1Asset) => ReadMapping(snapshot, Key(PrefixMapping, l1Asset)).L2Decimals;
 
     [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States | CallFlags.AllowNotify)]
     private async ContractTask ApplyDeposit(ApplicationEngine engine, uint sourceChainId, ulong nonce, UInt160 l1Asset, UInt160 recipient, BigInteger amount)
@@ -362,10 +388,15 @@ public sealed class L2BridgeContract : L2NativeContract
         var dedupe = Key(PrefixDepositConsumed, sourceChainId, nonce);
         if (engine.SnapshotCache.Contains(dedupe)) throw new InvalidOperationException("deposit replayed");
         engine.SnapshotCache.Add(dedupe, new StorageItem(new byte[] { 1 }));
-        var l2Asset = GetL2Asset(engine.SnapshotCache, l1Asset);
-        RequireNonZero(l2Asset, nameof(l2Asset));
-        await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "mint", l2Asset, recipient, amount);
-        Notify(engine, "Mint", l1Asset, recipient, amount, sourceChainId, nonce);
+        var mapping = ReadMapping(engine.SnapshotCache, Key(PrefixMapping, l1Asset));
+        RequireNonZero(mapping.Asset, nameof(l1Asset));
+        var l2Amount = ScaleAmount(amount, mapping.L1Decimals, mapping.L2Decimals);
+        if (IsPlatformToken(mapping.Asset))
+            await NativeContract.TokenManagement.MintInternal(engine, mapping.Asset, recipient, l2Amount,
+                assertOwner: false, callOnBalanceChanged: true, callOnPayment: true, callOnTransfer: true);
+        else
+            await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "mint", mapping.Asset, recipient, l2Amount);
+        Notify(engine, "Mint", l1Asset, recipient, l2Amount, sourceChainId, nonce);
     }
 
     [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States | CallFlags.AllowNotify)]
@@ -374,11 +405,72 @@ public sealed class L2BridgeContract : L2NativeContract
         RequireNonZero(l2Asset, nameof(l2Asset));
         RequirePositive(amount, nameof(amount));
         RequireNonZero(l1Recipient, nameof(l1Recipient));
+        var mapping = ReadMapping(engine.SnapshotCache, Key(PrefixMappingByL2, l2Asset));
+        RequireNonZero(mapping.Asset, nameof(l2Asset));
+        var l1Amount = ScaleAmount(amount, mapping.L2Decimals, mapping.L1Decimals);
         var caller = CallingScriptHash(engine);
         var nonce = NextNonce(engine.SnapshotCache, caller);
-        await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "burn", l2Asset, caller, amount);
-        Notify(engine, "WithdrawalEmitted", caller, l1Recipient, l2Asset, amount, nonce);
+        if (IsPlatformToken(l2Asset))
+            await NativeContract.TokenManagement.BurnInternal(engine, l2Asset, caller, amount,
+                assertOwner: false, callOnBalanceChanged: true, callOnTransfer: true);
+        else
+            await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "burn", l2Asset, caller, amount);
+        Notify(engine, "WithdrawalEmitted", caller, l1Recipient, l2Asset, l1Amount, nonce);
         return nonce;
+    }
+
+    private static bool IsPlatformToken(UInt160 l2Asset)
+    {
+        return l2Asset == NativeContract.Governance.NeoTokenId
+            || l2Asset == NativeContract.Governance.GasTokenId;
+    }
+
+    private static void ValidateDecimals(byte decimals, string name)
+    {
+        if (decimals > MaxTokenDecimals) throw new ArgumentOutOfRangeException(name, "decimals must be between 0 and 18.");
+    }
+
+    private static void ValidatePlatformMapping(UInt160 l2Asset, byte l1Decimals, byte l2Decimals)
+    {
+        if (l2Asset == NativeContract.Governance.GasTokenId &&
+            (l1Decimals != Governance.GasTokenDecimals || l2Decimals != Governance.GasTokenDecimals))
+            throw new InvalidOperationException("GAS mapping must use 8 decimals on both sides");
+        if (l2Asset == NativeContract.BridgedNep17.L2NeoTokenId &&
+            (l1Decimals != Governance.NeoTokenDecimals || l2Decimals != BridgedNep17Contract.PlatformNeoDecimals))
+            throw new InvalidOperationException("NEO mapping must convert L1 0 decimals to L2 8 decimals");
+    }
+
+    private static BigInteger ScaleAmount(BigInteger amount, byte fromDecimals, byte toDecimals)
+    {
+        ValidateDecimals(fromDecimals, nameof(fromDecimals));
+        ValidateDecimals(toDecimals, nameof(toDecimals));
+        if (fromDecimals == toDecimals) return amount;
+        var factor = BigInteger.Pow(10, Math.Abs(toDecimals - fromDecimals));
+        if (toDecimals > fromDecimals) return amount * factor;
+        var quotient = BigInteger.DivRem(amount, factor, out var remainder);
+        if (remainder != BigInteger.Zero)
+            throw new InvalidOperationException("amount cannot be represented exactly in the target decimal domain");
+        return quotient;
+    }
+
+    private static byte[] EncodeMapping(UInt160 asset, byte l1Decimals, byte l2Decimals)
+    {
+        var data = new byte[UInt160.Length + 2];
+        asset.ToArray().CopyTo(data, 0);
+        data[UInt160.Length] = l1Decimals;
+        data[UInt160.Length + 1] = l2Decimals;
+        return data;
+    }
+
+    private MappingEntry ReadMapping(IReadOnlyStore snapshot, StorageKey key)
+    {
+        if (!snapshot.TryGet(key, out var item)) return new MappingEntry(UInt160.Zero, 0, 0);
+        var bytes = item.Value.Span;
+        if (bytes.Length < UInt160.Length) return new MappingEntry(UInt160.Zero, 0, 0);
+        var asset = new UInt160(bytes[..UInt160.Length]);
+        if (bytes.Length == UInt160.Length) return new MappingEntry(asset, 8, 8);
+        if (bytes.Length < UInt160.Length + 2) return new MappingEntry(UInt160.Zero, 0, 0);
+        return new MappingEntry(asset, bytes[UInt160.Length], bytes[UInt160.Length + 1]);
     }
 
     private ulong NextNonce(DataCache snapshot, UInt160 sender)
@@ -388,6 +480,8 @@ public sealed class L2BridgeContract : L2NativeContract
         snapshot.GetAndChange(key, () => new StorageItem(BigInteger.Zero)).Set(next);
         return next;
     }
+
+    private readonly record struct MappingEntry(UInt160 Asset, byte L1Decimals, byte L2Decimals);
 }
 
 [ContractEvent(0, name: "FeesDistributed", "amount", ContractParameterType.Integer, "sequencerShare", ContractParameterType.Integer, "proverShare", ContractParameterType.Integer, "daShare", ContractParameterType.Integer)]
@@ -739,6 +833,10 @@ public sealed class L2AccountAbstraction : L2NativeContract
 [ContractEvent(0, name: "BridgedTokenCreated", "l1Asset", ContractParameterType.Hash160, "l2Asset", ContractParameterType.Hash160)]
 public sealed class BridgedNep17Contract : L2NativeContract
 {
+    public const string PlatformNeoName = "NEO";
+    public const string PlatformNeoSymbol = "NEO";
+    public const byte PlatformNeoDecimals = 8;
+    private static readonly BigInteger PlatformNeoMaxSupply = Governance.NeoTokenTotalAmount * BigInteger.Pow(10, PlatformNeoDecimals - Governance.NeoTokenDecimals);
     private const byte PrefixL1ToL2 = 0x01;
     private const byte PrefixL2ToL1 = 0x02;
     private const byte PrefixAuthorizedBridge = 0x03;
@@ -746,6 +844,15 @@ public sealed class BridgedNep17Contract : L2NativeContract
     private const byte KeyOwner = 0xff;
 
     internal BridgedNep17Contract() : base(-109) { }
+
+    public UInt160 L2NeoTokenId => field ??= TokenManagement.GetAssetId(Hash, PlatformNeoName);
+
+    internal override ContractTask InitializeAsync(ApplicationEngine engine, Hardfork? hardfork)
+    {
+        if (hardfork == ActiveIn && NativeContract.TokenManagement.GetTokenInfo(engine.SnapshotCache, L2NeoTokenId) is null)
+            NativeContract.TokenManagement.CreateInternal(engine, Hash, PlatformNeoName, PlatformNeoSymbol, PlatformNeoDecimals, PlatformNeoMaxSupply);
+        return ContractTask.CompletedTask;
+    }
 
     protected override void OnManifestCompose(IsHardforkEnabledDelegate hfChecker, uint blockHeight, ContractManifest manifest)
     {
@@ -801,7 +908,20 @@ public sealed class BridgedNep17Contract : L2NativeContract
         RequireNonZero(l1Asset, nameof(l1Asset));
         var existing = GetL2Asset(engine.SnapshotCache, l1Asset);
         if (existing != UInt160.Zero) throw new InvalidOperationException("L1 asset already mapped");
-        var assetId = await engine.CallFromNativeContractAsync<UInt160>(Hash, TokenManagement.Hash, "create", name, symbol, decimals, maxSupply);
+        var assetId = TokenManagement.GetAssetId(Hash, name);
+        var token = TokenManagement.GetTokenInfo(engine.SnapshotCache, assetId);
+        if (token is null)
+        {
+            assetId = await engine.CallFromNativeContractAsync<UInt160>(Hash, TokenManagement.Hash, "create", name, symbol, decimals, maxSupply);
+        }
+        else
+        {
+            if (token.Type != TokenType.Fungible || token.Owner != Hash || token.Name != name || token.Symbol != symbol ||
+                token.Decimals != decimals || token.MaxSupply != maxSupply)
+                throw new InvalidOperationException("existing bridged token metadata mismatch");
+            var mappedL1 = GetL1Asset(engine.SnapshotCache, assetId);
+            if (mappedL1 != UInt160.Zero && mappedL1 != l1Asset) throw new InvalidOperationException("L2 asset already mapped");
+        }
         engine.SnapshotCache.Add(Key(PrefixL1ToL2, l1Asset), new StorageItem(assetId.ToArray()));
         engine.SnapshotCache.Add(Key(PrefixL2ToL1, assetId), new StorageItem(l1Asset.ToArray()));
         Notify(engine, "BridgedTokenCreated", l1Asset, assetId);
