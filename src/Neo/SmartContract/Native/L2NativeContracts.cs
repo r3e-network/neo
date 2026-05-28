@@ -592,7 +592,8 @@ public sealed class L2FeeContract : L2NativeContract
         var bps = GetBps(engine.SnapshotCache);
         var sequencerShare = amount * bps[0] / BasisPointsTotal;
         var proverShare = amount * bps[1] / BasisPointsTotal;
-        var daShare = amount * bps[2] / BasisPointsTotal; // consistent division, avoids negative residual
+        // Last share absorbs rounding remainder to prevent dust loss
+        var daShare = amount - sequencerShare - proverShare;
         var asset = ReadUInt160(engine.SnapshotCache, KeyFeeAsset);
         await TransferFeeShare(engine, asset, ReadUInt160(engine.SnapshotCache, KeySequencerAddress), sequencerShare);
         await TransferFeeShare(engine, asset, ReadUInt160(engine.SnapshotCache, KeyProverAddress), proverShare);

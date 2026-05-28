@@ -103,7 +103,7 @@ public class MemoryPool : IReadOnlyCollection<Transaction>
             }
             finally
             {
-            _txRwLock.ExitWriteLock();
+                _txRwLock.ExitReadLock();
             }
         }
     }
