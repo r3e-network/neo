@@ -23,12 +23,16 @@ public abstract class L2NativeContract : NativeContract
 
     protected UInt160 ReadUInt160(IReadOnlyStore snapshot, byte prefix)
     {
-        return snapshot.TryGet(CreateStorageKey(prefix), out var item) ? new UInt160(item.Value.Span) : UInt160.Zero;
+        return snapshot.TryGet(CreateStorageKey(prefix), out var item) && item.Value.Length >= UInt160.Length
+            ? new UInt160(item.Value.Span[..UInt160.Length])
+            : UInt160.Zero;
     }
 
     protected UInt160 ReadUInt160(IReadOnlyStore snapshot, StorageKey key)
     {
-        return snapshot.TryGet(key, out var item) ? new UInt160(item.Value.Span) : UInt160.Zero;
+        return snapshot.TryGet(key, out var item) && item.Value.Length >= UInt160.Length
+            ? new UInt160(item.Value.Span[..UInt160.Length])
+            : UInt160.Zero;
     }
 
     protected void WriteUInt160(DataCache snapshot, byte prefix, UInt160 value)

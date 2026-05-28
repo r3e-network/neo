@@ -272,7 +272,7 @@ public sealed partial class Blockchain : UntypedActor
             {
                 foreach (var unverifiedBlock in unverifiedBlocks.Blocks)
                     Self.Tell(unverifiedBlock, ActorRefs.NoSender);
-                _blockCacheUnverified.Remove(block.Index + 1);
+                _blockCacheUnverified.Remove(currentHeight + 1);
             }
         }
         else
