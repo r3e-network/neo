@@ -197,7 +197,13 @@ public sealed class L2SystemConfigContract : L2NativeContract
     public UInt160 GetSystemAccount(IReadOnlyStore snapshot) => ReadUInt160(snapshot, KeySystemAccount);
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
-    public uint GetChainId(IReadOnlyStore snapshot) => (uint)ReadInteger(snapshot, KeyChainId);
+    public uint GetChainId(IReadOnlyStore snapshot)
+    {
+        var value = ReadInteger(snapshot, KeyChainId);
+        if (value > uint.MaxValue || value < 0)
+            throw new InvalidOperationException("chainId overflow");
+        return (uint)value;
+    }
 
     [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States | CallFlags.AllowNotify)]
     private void SetSlot(ApplicationEngine engine, byte slot, byte[] value)
@@ -246,7 +252,13 @@ public sealed class L2BatchInfoContract : L2NativeContract
     }
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
-    public uint GetChainId(IReadOnlyStore snapshot) => (uint)ReadInteger(snapshot, KeyChainId);
+    public uint GetChainId(IReadOnlyStore snapshot)
+    {
+        var value = ReadInteger(snapshot, KeyChainId);
+        if (value > uint.MaxValue || value < 0)
+            throw new InvalidOperationException("chainId overflow");
+        return (uint)value;
+    }
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
     public ulong GetBatchNumber(IReadOnlyStore snapshot) => (ulong)ReadInteger(snapshot, KeyBatchNumber);
@@ -292,7 +304,13 @@ public sealed class L2MessageContract : L2NativeContract
     }
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
-    public uint GetChainId(IReadOnlyStore snapshot) => (uint)ReadInteger(snapshot, KeyChainId);
+    public uint GetChainId(IReadOnlyStore snapshot)
+    {
+        var value = ReadInteger(snapshot, KeyChainId);
+        if (value > uint.MaxValue || value < 0)
+            throw new InvalidOperationException("chainId overflow");
+        return (uint)value;
+    }
 
     [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States | CallFlags.AllowNotify)]
     private ulong EmitMessage(ApplicationEngine engine, uint targetChainId, UInt160 receiver, byte messageType, byte[] payload)
@@ -574,7 +592,7 @@ public sealed class L2FeeContract : L2NativeContract
         var bps = GetBps(engine.SnapshotCache);
         var sequencerShare = amount * bps[0] / BasisPointsTotal;
         var proverShare = amount * bps[1] / BasisPointsTotal;
-        var daShare = amount - sequencerShare - proverShare;
+        var daShare = amount * bps[2] / BasisPointsTotal; // consistent division, avoids negative residual
         var asset = ReadUInt160(engine.SnapshotCache, KeyFeeAsset);
         await TransferFeeShare(engine, asset, ReadUInt160(engine.SnapshotCache, KeySequencerAddress), sequencerShare);
         await TransferFeeShare(engine, asset, ReadUInt160(engine.SnapshotCache, KeyProverAddress), proverShare);

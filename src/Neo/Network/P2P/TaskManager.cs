@@ -371,7 +371,7 @@ public class TaskManager : UntypedActor
                 session.AvailableTasks.Remove(hashes);
 
                 foreach (UInt256 hash in hashes)
-                    session.InvTasks[hash] = DateTime.UtcNow;
+                    session.InvTasks[hash] = TimeProvider.Current.UtcNow;
 
                 foreach (InvPayload group in InvPayload.CreateGroup(InventoryType.Block, hashes))
                     remoteNode.Tell(Message.Create(MessageCommand.GetData, group));

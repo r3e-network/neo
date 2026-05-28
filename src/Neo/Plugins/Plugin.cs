@@ -23,9 +23,12 @@ namespace Neo.Plugins;
 public abstract class Plugin : IDisposable
 {
     /// <summary>
-    /// A list of all loaded plugins.
+    /// A list of all loaded plugins. Populated during startup (single-threaded),
+    /// read during runtime (multi-threaded). Lock protects against the race
+    /// between late plugin construction and SendMessage enumeration.
     /// </summary>
     public static readonly List<Plugin> Plugins = [];
+    private static readonly Lock s_pluginsLock = new();
 
     /// <summary>
     /// The directory containing the plugin folders. Files can be contained in any subdirectory.
@@ -99,7 +102,7 @@ public abstract class Plugin : IDisposable
     /// </summary>
     protected Plugin()
     {
-        Plugins.Add(this);
+        lock (s_pluginsLock) { Plugins.Add(this); }
         Configure();
     }
 
@@ -259,7 +262,9 @@ public abstract class Plugin : IDisposable
     /// <returns><see langword="true"/> if the <paramref name="message"/> is handled by a plugin; otherwise, <see langword="false"/>.</returns>
     public static bool SendMessage(object message)
     {
-        foreach (var plugin in Plugins)
+        List<Plugin> snapshot;
+        lock (s_pluginsLock) { snapshot = [.. Plugins]; }
+        foreach (var plugin in snapshot)
         {
             if (plugin.IsStopped) continue;
 
