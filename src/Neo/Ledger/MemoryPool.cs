@@ -103,7 +103,7 @@ public class MemoryPool : IReadOnlyCollection<Transaction>
             }
             finally
             {
-                _txRwLock.ExitReadLock();
+            _txRwLock.ExitWriteLock();
             }
         }
     }
@@ -690,7 +690,7 @@ public class MemoryPool : IReadOnlyCollection<Transaction>
     // Do not use this method outside of unit tests
     internal void Clear()
     {
-        _txRwLock.EnterReadLock();
+        _txRwLock.EnterWriteLock();
         try
         {
             _unsortedTransactions.Clear();

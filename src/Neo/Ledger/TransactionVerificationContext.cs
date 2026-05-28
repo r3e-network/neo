@@ -41,9 +41,9 @@ public class TransactionVerificationContext
         if (oracle != null) _oracleResponses.Add(oracle.Id, tx.Hash);
 
         if (_senderFee.TryGetValue(tx.Sender, out var value))
-            _senderFee[tx.Sender] = value + tx.SystemFee + tx.NetworkFee;
+            _senderFee[tx.Sender] = value + (BigInteger)tx.SystemFee + (BigInteger)tx.NetworkFee;
         else
-            _senderFee.Add(tx.Sender, tx.SystemFee + tx.NetworkFee);
+            _senderFee.Add(tx.Sender, (BigInteger)tx.SystemFee + (BigInteger)tx.NetworkFee);
     }
 
     /// <summary>
@@ -58,9 +58,9 @@ public class TransactionVerificationContext
         var balance = NativeContract.TokenManagement.BalanceOf(snapshot, NativeContract.Governance.GasTokenId, tx.Sender);
         _senderFee.TryGetValue(tx.Sender, out var totalSenderFeeFromPool);
 
-        var expectedFee = tx.SystemFee + tx.NetworkFee + totalSenderFeeFromPool;
+        var expectedFee = (BigInteger)tx.SystemFee + (BigInteger)tx.NetworkFee + totalSenderFeeFromPool;
         foreach (var conflictTx in conflictingTxs.Where(c => c.Sender.Equals(tx.Sender)))
-            expectedFee -= conflictTx.NetworkFee + conflictTx.SystemFee;
+            expectedFee -= (BigInteger)conflictTx.NetworkFee + (BigInteger)conflictTx.SystemFee;
         if (balance < expectedFee) return false;
 
         var oracle = tx.GetAttribute<OracleResponse>();

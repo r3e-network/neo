@@ -46,6 +46,12 @@ public abstract class L2NativeContract : NativeContract
         if (value <= 0) throw new ArgumentOutOfRangeException(name, "must be positive.");
     }
 
+    protected static ulong IncrementNonce(ulong current)
+    {
+        if (current == ulong.MaxValue) throw new InvalidOperationException("nonce overflow");
+        return current + 1;
+    }
+
     protected BigInteger ReadInteger(IReadOnlyStore snapshot, byte prefix)
     {
         return snapshot.TryGet(CreateStorageKey(prefix), out var item) ? (BigInteger)item : BigInteger.Zero;
@@ -317,7 +323,7 @@ public sealed class L2MessageContract : L2NativeContract
     private ulong NextNonce(DataCache snapshot, UInt160 sender)
     {
         var key = Key(PrefixOutboundNonce, sender);
-        var next = (ulong)ReadInteger(snapshot, key) + 1;
+        var next = IncrementNonce((ulong)ReadInteger(snapshot, key));
         snapshot.GetAndChange(key, () => new StorageItem(BigInteger.Zero)).Set(next);
         return next;
     }
@@ -499,7 +505,7 @@ public sealed class L2BridgeContract : L2NativeContract
     private ulong NextNonce(DataCache snapshot, UInt160 sender)
     {
         var key = Key(PrefixWithdrawalNonce, sender);
-        var next = (ulong)ReadInteger(snapshot, key) + 1;
+        var next = IncrementNonce((ulong)ReadInteger(snapshot, key));
         snapshot.GetAndChange(key, () => new StorageItem(BigInteger.Zero)).Set(next);
         return next;
     }
@@ -718,7 +724,7 @@ public sealed class L2NativeExternalBridgeContract : L2NativeContract
         var sender = CallingScriptHash(engine);
         await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "burn", l2Asset, sender, amount);
         var nonceKey = CreateStorageKey(PrefixOutboundNonce, U32Le(externalChainId));
-        var next = (ulong)ReadInteger(engine.SnapshotCache, nonceKey) + 1;
+        var next = IncrementNonce((ulong)ReadInteger(engine.SnapshotCache, nonceKey));
         engine.SnapshotCache.GetAndChange(nonceKey, () => new StorageItem(BigInteger.Zero)).Set(next);
         Notify(engine, "ExternalSendInitiated", externalChainId, next, sender, recipient, l2Asset, amount, calldata);
         return next;
@@ -794,7 +800,7 @@ public sealed class L2AccountAbstraction : L2NativeContract
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
     private async ContractTask<bool> ValidateTx(ApplicationEngine engine, UInt160 account, ulong nonce, UInt256 txHash, byte[] signature)
     {
-        if (account == UInt160.Zero || nonce != GetNonce(engine.SnapshotCache, account) + 1) return false;
+        if (account == UInt160.Zero || nonce != IncrementNonce(GetNonce(engine.SnapshotCache, account))) return false;
         var validator = GetValidator(engine.SnapshotCache, account);
         if (validator == UInt160.Zero) return engine.CheckWitnessInternal(account);
         return await engine.CallFromNativeContractAsync<bool>(Hash, validator, "validateTx", account, nonce, txHash, signature);
@@ -839,7 +845,7 @@ public sealed class L2AccountAbstraction : L2NativeContract
     private void ConsumeNonceInternal(ApplicationEngine engine, UInt160 account, ulong nonce)
     {
         RequireNonZero(account, nameof(account));
-        if (nonce != GetNonce(engine.SnapshotCache, account) + 1) throw new InvalidOperationException("nonce out of sequence");
+        if (nonce != IncrementNonce(GetNonce(engine.SnapshotCache, account))) throw new InvalidOperationException("nonce out of sequence");
         engine.SnapshotCache.GetAndChange(Key(PrefixNonce, account), () => new StorageItem(BigInteger.Zero)).Set(nonce);
         Notify(engine, "NonceConsumed", account, nonce);
     }
