@@ -632,10 +632,10 @@ public sealed class L2PaymasterContract : L2NativeContract
         RequirePositive(amount, nameof(amount));
         if (!IsApproved(engine.SnapshotCache, asset)) throw new InvalidOperationException("asset not approved");
         var caller = CallingScriptHash(engine);
-        if (!await engine.CallFromNativeContractAsync<bool>(Hash, asset, "transfer", caller, Hash, amount, StackItem.Null))
-            throw new InvalidOperationException("asset transfer failed");
         var key = Key(PrefixBalance, user, asset);
         engine.SnapshotCache.GetAndChange(key, () => new StorageItem(BigInteger.Zero)).Add(amount);
+        if (!await engine.CallFromNativeContractAsync<bool>(Hash, asset, "transfer", caller, Hash, amount, StackItem.Null))
+            throw new InvalidOperationException("asset transfer failed");
         Notify(engine, "TopUp", user, asset, amount);
     }
 
@@ -734,8 +734,8 @@ public sealed class L2NativeExternalBridgeContract : L2NativeContract
         if (!IsL2AssetRegistered(engine.SnapshotCache, externalChainId, l2Asset)) throw new InvalidOperationException("asset not registered for external chain");
         var consumed = Key(PrefixConsumedInboundNonce, externalChainId, nonce);
         if (engine.SnapshotCache.Contains(consumed)) throw new InvalidOperationException("inbound nonce already consumed");
-        await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "mint", l2Asset, l2Recipient, amount);
         engine.SnapshotCache.Add(consumed, new StorageItem(new byte[] { 1 }));
+        await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "mint", l2Asset, l2Recipient, amount);
         Notify(engine, "ExternalInboundApplied", externalChainId, nonce, foreignSender, l2Recipient, amount);
     }
 
