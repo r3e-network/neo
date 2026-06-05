@@ -12,6 +12,7 @@ using Neo.Extensions.IO;
 using Neo.Persistence;
 using Neo.SmartContract.Manifest;
 using Neo.VM.Types;
+using System.IO;
 using System.Numerics;
 using System.Text;
 
@@ -845,6 +846,8 @@ public sealed class L2AccountAbstraction : L2NativeContract
     [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States | CallFlags.AllowNotify)]
     private async ContractTask<StackItem> ExecuteTx(ApplicationEngine engine, UInt160 account, ulong nonce, UInt256 txHash, UInt160 target, string method, StackItem[] args, UInt160 feeAsset, BigInteger feeAmount, byte[] signature)
     {
+        var expectedHash = ComputeExecutionHash(engine, account, nonce, target, method, args, feeAsset, feeAmount);
+        if (txHash != expectedHash) throw new InvalidOperationException("txHash does not match execution payload");
         if (!await ValidateTx(engine, account, nonce, txHash, signature)) throw new InvalidOperationException("AA validation failed");
         RequireNonZero(target, nameof(target));
         if (string.IsNullOrWhiteSpace(method)) throw new ArgumentException("method required", nameof(method));
@@ -853,6 +856,34 @@ public sealed class L2AccountAbstraction : L2NativeContract
         var result = await engine.CallFromNativeContractAsync<StackItem>(Hash, target, method, args);
         Notify(engine, "TxExecuted", account, nonce, target, method);
         return result;
+    }
+
+    private UInt256 ComputeExecutionHash(ApplicationEngine engine, UInt160 account, ulong nonce, UInt160 target, string method, StackItem[] args, UInt160 feeAsset, BigInteger feeAmount)
+    {
+        RequireNonZero(account, nameof(account));
+        RequireNonZero(target, nameof(target));
+        if (string.IsNullOrWhiteSpace(method)) throw new ArgumentException("method required", nameof(method));
+        if (feeAmount < BigInteger.Zero) throw new ArgumentOutOfRangeException(nameof(feeAmount), "fee amount cannot be negative.");
+
+        var methodBytes = Encoding.UTF8.GetBytes(method);
+        var argsBytes = BinarySerializer.Serialize(new Neo.VM.Types.Array(args), engine.Limits);
+        var feeAmountBytes = feeAmount.ToByteArray(isUnsigned: true, isBigEndian: false);
+
+        using MemoryStream ms = new();
+        using BinaryWriter writer = new(ms, Utility.StrictUTF8, true);
+        writer.Write("neo4-aa-execute-v1"u8);
+        writer.Write(Hash.ToArray());
+        writer.Write(account.ToArray());
+        writer.Write(nonce);
+        writer.Write(target.ToArray());
+        writer.Write(methodBytes.Length);
+        writer.Write(methodBytes);
+        writer.Write(argsBytes.Length);
+        writer.Write(argsBytes);
+        writer.Write(feeAsset.ToArray());
+        writer.Write(feeAmountBytes.Length);
+        writer.Write(feeAmountBytes);
+        return new UInt256(Crypto.Hash256(ms.ToArray()));
     }
 
     private async ContractTask ChargePaymaster(ApplicationEngine engine, UInt160 account, UInt160 feeAsset, BigInteger feeAmount)
