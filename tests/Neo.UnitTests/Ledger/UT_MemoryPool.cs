@@ -794,6 +794,36 @@ public class UT_MemoryPool : TestKit
     }
 
     [TestMethod]
+    public void UpdatePoolForBlockPersisted_EmptyPoolKeepsLockState()
+    {
+        var block = new Block
+        {
+            Header = new Header
+            {
+                PrevHash = null!,
+                MerkleRoot = null!,
+                NextConsensus = null!,
+                Witness = null!
+            },
+            Transactions = []
+        };
+
+        _unit.UpdatePoolForBlockPersisted(block, GetSnapshot());
+
+        Assert.HasCount(0, _unit);
+    }
+
+    [TestMethod]
+    public void MemoryPool_ClearReleasesWriteLock()
+    {
+        AddTransactions(1);
+
+        _unit.Clear();
+
+        Assert.HasCount(0, _unit);
+    }
+
+    [TestMethod]
     public void TestTryRemoveUnVerified()
     {
         AddTransactions(32);

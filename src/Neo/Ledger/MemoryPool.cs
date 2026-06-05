@@ -101,10 +101,10 @@ public class MemoryPool : IReadOnlyCollection<Transaction>
             {
                 return _unsortedTransactions.Count + _unverifiedTransactions.Count;
             }
-        finally
-        {
-            _txRwLock.ExitWriteLock();
-        }
+            finally
+            {
+                _txRwLock.ExitReadLock();
+            }
         }
     }
 
@@ -701,7 +701,7 @@ public class MemoryPool : IReadOnlyCollection<Transaction>
         }
         finally
         {
-            _txRwLock.ExitReadLock();
+            _txRwLock.ExitWriteLock();
         }
     }
 }
