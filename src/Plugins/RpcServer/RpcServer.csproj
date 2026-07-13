@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Neo.Plugins.RpcServer</PackageId>
+    <RootNamespace>Neo.Plugins.RpcServer</RootNamespace>
+    <AssemblyName>RpcServer</AssemblyName>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Neo\Neo.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="RpcServer.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Neo.Plugins.RpcServer.Tests" />
+    <InternalsVisibleTo Include="Neo.Plugins.L2Rpc.UnitTests" />
+  </ItemGroup>
+
+</Project>
