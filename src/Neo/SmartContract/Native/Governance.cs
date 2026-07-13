@@ -22,6 +22,12 @@ using System.Numerics;
 
 namespace Neo.SmartContract.Native;
 
+public static class NeoToken
+{
+    public static bool ShouldRefreshCommittee(uint height, int committeeMembersCount) =>
+        Governance.ShouldRefreshCommittee(height, committeeMembersCount);
+}
+
 [ContractEvent(0, name: "CandidateStateChanged", "pubkey", ContractParameterType.PublicKey, "registered", ContractParameterType.Boolean, "votes", ContractParameterType.Integer)]
 [ContractEvent(1, name: "Vote", "account", ContractParameterType.Hash160, "from", ContractParameterType.PublicKey, "to", ContractParameterType.PublicKey, "amount", ContractParameterType.Integer)]
 [ContractEvent(2, name: "CommitteeChanged", "old", ContractParameterType.Array, "new", ContractParameterType.Array)]
@@ -91,6 +97,7 @@ public sealed class Governance : NativeContract
             {
                 Notify(engine, "CommitteeChanged", prevCommittee, newCommittee);
             }
+            NativeContract.L2SystemConfig.ActivatePendingSequencerValidators(engine);
         }
         long totalNetworkFee = 0;
         foreach (Transaction tx in engine.PersistingBlock!.Transactions)
@@ -427,6 +434,9 @@ public sealed class Governance : NativeContract
     /// <returns>The public keys of the validators.</returns>
     public ECPoint[] GetNextBlockValidators(IReadOnlyStore snapshot, int validatorsCount)
     {
+        if (NativeContract.L2SystemConfig.TryGetSequencerValidators(snapshot, validatorsCount, out var l2Validators))
+            return l2Validators;
+
         return GetCommitteeFromCache(snapshot)
             .Take(validatorsCount)
             .Select(p => p.PublicKey)
@@ -562,6 +572,9 @@ public sealed class Governance : NativeContract
     /// <returns>The public keys of the validators.</returns>
     public ECPoint[] ComputeNextBlockValidators(IReadOnlyStore snapshot, ProtocolSettings settings)
     {
+        if (NativeContract.L2SystemConfig.TryGetNextSequencerValidators(snapshot, settings.ValidatorsCount, out var l2Validators))
+            return l2Validators;
+
         return ComputeCommitteeMembers(snapshot, settings).Select(p => p.PublicKey).Take(settings.ValidatorsCount).OrderBy(p => p).ToArray();
     }
 

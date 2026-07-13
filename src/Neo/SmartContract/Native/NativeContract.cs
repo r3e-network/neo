@@ -100,6 +100,8 @@ public abstract class NativeContract
 
     public static Governance Governance { get; } = new();
 
+    public static Governance NEO => Governance;
+
     public static L2SystemConfigContract L2SystemConfig { get; } = new();
 
     public static L2BatchInfoContract L2BatchInfo { get; } = new();

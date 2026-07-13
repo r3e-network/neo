@@ -1,11 +1,24 @@
+// Copyright (C) 2015-2026 The Neo Project.
+//
+// UT_L2NativeContracts.cs file belongs to the neo project and is free
+// software distributed under the MIT software license, see the
+// accompanying file LICENSE in the main directory of the
+// repository or http://www.opensource.org/licenses/mit-license.php
+// for more details.
+//
+// Redistribution and use in source and binary forms with or without
+// modifications are permitted.
+
+using Neo.Cryptography.ECC;
 using Neo.Extensions.VM;
-using Neo.SmartContract.Native;
 using Neo.Network.P2P.Payloads;
 using Neo.Persistence;
 using Neo.SmartContract;
+using Neo.SmartContract.Native;
 using Neo.UnitTests.Extensions;
 using Neo.VM;
 using Neo.VM.Types;
+using Neo.Wallets;
 using System.Numerics;
 
 namespace Neo.UnitTests.SmartContract.Native;
@@ -55,6 +68,94 @@ public class UT_L2NativeContracts
             CollectionAssert.DoesNotContain(methodNames, "deploy", $"{name} must not expose a deployment method.");
             CollectionAssert.DoesNotContain(methodNames, "update", $"{name} must not expose an update method.");
         }
+    }
+
+    [TestMethod]
+    public void L2SystemConfig_SequencerValidatorsDriveNativeDbftSelector()
+    {
+        var snapshot = TestBlockchain.GetTestSnapshotCache().CloneCache();
+        var block = CreatePersistingBlock();
+        var committee = NativeContract.Governance.GetCommitteeAddress(snapshot);
+        var owner = UInt160.Parse("0x0101010101010101010101010101010101010101");
+        var systemAccount = UInt160.Parse("0x0202020202020202020202020202020202020202");
+        var validators = Enumerable.Range(1, TestProtocolSettings.Default.ValidatorsCount)
+            .Select(static index => new KeyPair(Enumerable.Repeat((byte)(index + 64), 32).ToArray()).PublicKey)
+            .ToArray();
+
+        NativeContract.L2SystemConfig.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+            "configure", Hash160(owner), Hash160(systemAccount), Integer(1099));
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2SystemConfig.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "configure", Hash160(owner), Hash160(systemAccount), Integer(1100)));
+        NativeContract.L2SystemConfig.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+            "setSequencerValidators", PublicKeys(validators));
+
+        var expected = validators.OrderBy(static validator => validator).ToArray();
+        var genesis = TestProtocolSettings.Default.StandbyValidators.OrderBy(static validator => validator).ToArray();
+        CollectionAssert.AreEqual(genesis, NativeContract.L2SystemConfig.GetSequencerValidators(snapshot));
+        CollectionAssert.AreEqual(expected, NativeContract.L2SystemConfig.GetPendingSequencerValidators(snapshot));
+        CollectionAssert.AreEqual(
+            genesis,
+            NativeContract.NEO.GetNextBlockValidators(snapshot, TestProtocolSettings.Default.ValidatorsCount));
+        CollectionAssert.AreEqual(
+            expected,
+            NativeContract.NEO.ComputeNextBlockValidators(snapshot, TestProtocolSettings.Default));
+        Assert.AreNotEqual(Contract.GetBFTAddress(genesis), Contract.GetBFTAddress(expected));
+
+        block.Header.Index = (uint)TestProtocolSettings.Default.CommitteeMembersCount;
+        using var script = new ScriptBuilder();
+        script.EmitSysCall(ApplicationEngine.System_Contract_NativeOnPersist);
+        using var engine = ApplicationEngine.Create(
+            TriggerType.OnPersist,
+            null,
+            snapshot,
+            block,
+            settings: TestProtocolSettings.Default);
+        engine.LoadScript(script.ToArray());
+        Assert.AreEqual(VMState.HALT, engine.Execute(), engine.FaultException?.ToString());
+
+        CollectionAssert.AreEqual(expected, NativeContract.L2SystemConfig.GetSequencerValidators(snapshot));
+        CollectionAssert.AreEqual(System.Array.Empty<ECPoint>(), NativeContract.L2SystemConfig.GetPendingSequencerValidators(snapshot));
+        CollectionAssert.AreEqual(
+            expected,
+            NativeContract.NEO.GetNextBlockValidators(snapshot, TestProtocolSettings.Default.ValidatorsCount));
+        Assert.AreSame(NativeContract.Governance, NativeContract.NEO);
+        Assert.AreEqual(
+            Governance.ShouldRefreshCommittee(21, 21),
+            NeoToken.ShouldRefreshCommittee(21, 21));
+    }
+
+    [TestMethod]
+    public void L2SystemConfig_SequencerValidatorsFailClosedOnInvalidUpdates()
+    {
+        var snapshot = TestBlockchain.GetTestSnapshotCache().CloneCache();
+        var block = CreatePersistingBlock();
+        var committee = NativeContract.Governance.GetCommitteeAddress(snapshot);
+        var owner = UInt160.Parse("0x0101010101010101010101010101010101010101");
+        var systemAccount = UInt160.Parse("0x0202020202020202020202020202020202020202");
+        var validators = TestProtocolSettings.Default.StandbyCommittee
+            .Take(TestProtocolSettings.Default.ValidatorsCount)
+            .ToArray();
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2SystemConfig.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+                "setSequencerValidators", PublicKeys(validators)));
+
+        NativeContract.L2SystemConfig.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
+            "configure", Hash160(owner), Hash160(systemAccount), Integer(1099));
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2SystemConfig.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(systemAccount), block,
+                "setSequencerValidators", PublicKeys(validators)));
+        Assert.ThrowsExactly<ArgumentException>(() =>
+            NativeContract.L2SystemConfig.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setSequencerValidators", PublicKeys(validators[..^1])));
+
+        var duplicate = validators.ToArray();
+        duplicate[^1] = duplicate[0];
+        Assert.ThrowsExactly<ArgumentException>(() =>
+            NativeContract.L2SystemConfig.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
+                "setSequencerValidators", PublicKeys(duplicate)));
     }
 
     [TestMethod]
@@ -340,6 +441,19 @@ public class UT_L2NativeContracts
     private static ContractParameter ByteArray(byte[] value)
     {
         return new ContractParameter(ContractParameterType.ByteArray) { Value = value };
+    }
+
+    private static ContractParameter PublicKeys(IEnumerable<ECPoint> validators)
+    {
+        return new ContractParameter(ContractParameterType.Array)
+        {
+            Value = validators
+                .Select(static validator => new ContractParameter(ContractParameterType.ByteArray)
+                {
+                    Value = validator.EncodePoint(true)
+                })
+                .ToList()
+        };
     }
 
     private static ContractParameter Boolean(bool value)

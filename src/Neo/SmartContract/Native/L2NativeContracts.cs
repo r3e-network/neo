@@ -1,12 +1,18 @@
 // Copyright (C) 2015-2026 The Neo Project.
 //
-// N4 L2 native contracts are maintained by r3e-network in the r3e/neo-n4-core
-// branch. They are registered as Neo native contracts so an L2 chain does not
-// deploy these system contracts after genesis.
+// L2NativeContracts.cs file belongs to the neo project and is free
+// software distributed under the MIT software license, see the
+// accompanying file LICENSE in the main directory of the
+// repository or http://www.opensource.org/licenses/mit-license.php
+// for more details.
+//
+// Redistribution and use in source and binary forms with or without
+// modifications are permitted.
 
 #pragma warning disable IDE0051
 
 using Neo.Cryptography;
+using Neo.Cryptography.ECC;
 using Neo.Extensions;
 using Neo.Extensions.IO;
 using Neo.Persistence;
@@ -164,8 +170,12 @@ public abstract class L2NativeContract : NativeContract
 }
 
 [ContractEvent(0, name: "ConfigUpdated", "slot", ContractParameterType.Integer, "value", ContractParameterType.ByteArray)]
+[ContractEvent(1, name: "SequencerCommitteeChanged", "old", ContractParameterType.Array, "new", ContractParameterType.Array)]
+[ContractEvent(2, name: "SequencerCommitteeScheduled", "old", ContractParameterType.Array, "new", ContractParameterType.Array)]
 public sealed class L2SystemConfigContract : L2NativeContract
 {
+    private const int CompressedPublicKeyLength = 33;
+    private const int MaxSequencerValidators = 64;
     private const byte KeySystemAccount = 0x01;
     private const byte KeyL1MessageContract = 0x02;
     private const byte KeyBridgeContract = 0x03;
@@ -175,6 +185,8 @@ public sealed class L2SystemConfigContract : L2NativeContract
     private const byte KeyPaymasterContract = 0x07;
     private const byte KeyChainId = 0x08;
     private const byte KeySettingsBlob = 0x09;
+    private const byte KeySequencerValidators = 0x0a;
+    private const byte KeyPendingSequencerValidators = 0x0b;
     private const byte KeyOwner = 0xff;
 
     internal L2SystemConfigContract() : base(-101) { }
@@ -186,6 +198,25 @@ public sealed class L2SystemConfigContract : L2NativeContract
         RequireNonZero(systemAccount, nameof(systemAccount));
         if (chainId == 0) throw new ArgumentOutOfRangeException(nameof(chainId), "chainId 0 is reserved for L1.");
         AssertOwnerOrCommittee(engine, KeyOwner);
+        var existingChainId = GetChainId(engine.SnapshotCache);
+        if (existingChainId != 0 && existingChainId != chainId)
+            throw new InvalidOperationException("The configured L2 chainId is immutable.");
+        if (existingChainId == 0)
+        {
+            var genesisValidators = engine.ProtocolSettings.StandbyValidators
+                .OrderBy(static validator => validator)
+                .ToArray();
+            if (genesisValidators.Length is < 1 or > MaxSequencerValidators)
+                throw new InvalidOperationException(
+                    $"Protocol ValidatorsCount must be between 1 and {MaxSequencerValidators}.");
+            var currentValidators = NativeContract.Governance.GetNextBlockValidators(
+                engine.SnapshotCache,
+                engine.ProtocolSettings.ValidatorsCount);
+            if (!currentValidators.SequenceEqual(genesisValidators))
+                throw new InvalidOperationException(
+                    "L2 system configuration must be initialized while the active committee still matches StandbyValidators.");
+            WriteSequencerValidators(engine.SnapshotCache, KeySequencerValidators, genesisValidators);
+        }
         WriteUInt160(engine.SnapshotCache, KeyOwner, owner);
         WriteUInt160(engine.SnapshotCache, KeySystemAccount, systemAccount);
         WriteInteger(engine.SnapshotCache, KeyChainId, chainId);
@@ -226,6 +257,131 @@ public sealed class L2SystemConfigContract : L2NativeContract
     {
         var raw = GetSlot(snapshot, slot);
         return raw.Length == UInt160.Length ? new UInt160(raw) : UInt160.Zero;
+    }
+
+    [ContractMethod(CpuFee = 1 << 16, StorageFee = 1 << 10, RequiredCallFlags = CallFlags.States | CallFlags.AllowNotify)]
+    private void SetSequencerValidators(ApplicationEngine engine, ECPoint[] validators)
+    {
+        ArgumentNullException.ThrowIfNull(validators);
+        if (GetChainId(engine.SnapshotCache) == 0)
+            throw new InvalidOperationException("L2 system configuration must be initialized before setting sequencer validators.");
+
+        AssertOwnerOrCommittee(engine, KeyOwner);
+        var expectedCount = engine.ProtocolSettings.ValidatorsCount;
+        if (expectedCount is < 1 or > MaxSequencerValidators)
+            throw new InvalidOperationException($"Protocol ValidatorsCount must be between 1 and {MaxSequencerValidators}.");
+        if (validators.Length != expectedCount)
+            throw new ArgumentException($"Sequencer validator count must equal protocol ValidatorsCount ({expectedCount}).", nameof(validators));
+        if (validators.Any(static validator => validator.IsInfinity))
+            throw new ArgumentException("The point at infinity is not a valid sequencer key.", nameof(validators));
+
+        var canonical = validators.OrderBy(static validator => validator).ToArray();
+        if (canonical.Distinct().Count() != canonical.Length)
+            throw new ArgumentException("Duplicate sequencer public keys are not allowed.", nameof(validators));
+
+        var active = GetSequencerValidators(engine.SnapshotCache);
+        var previousPending = GetPendingSequencerValidators(engine.SnapshotCache);
+        if (active.SequenceEqual(canonical))
+        {
+            if (previousPending.Length > 0)
+                engine.SnapshotCache.Delete(CreateStorageKey(KeyPendingSequencerValidators));
+            return;
+        }
+        if (previousPending.SequenceEqual(canonical)) return;
+
+        WriteSequencerValidators(engine.SnapshotCache, KeyPendingSequencerValidators, canonical);
+        Notify(engine, "SequencerCommitteeScheduled", previousPending, canonical);
+    }
+
+    [ContractMethod(CpuFee = 1 << 16, RequiredCallFlags = CallFlags.ReadStates)]
+    public ECPoint[] GetSequencerValidators(IReadOnlyStore snapshot)
+    {
+        return ReadSequencerValidators(snapshot, KeySequencerValidators);
+    }
+
+    [ContractMethod(CpuFee = 1 << 16, RequiredCallFlags = CallFlags.ReadStates)]
+    public ECPoint[] GetPendingSequencerValidators(IReadOnlyStore snapshot)
+    {
+        return ReadSequencerValidators(snapshot, KeyPendingSequencerValidators);
+    }
+
+    internal void ActivatePendingSequencerValidators(ApplicationEngine engine)
+    {
+        if (GetChainId(engine.SnapshotCache) == 0) return;
+        var pending = GetPendingSequencerValidators(engine.SnapshotCache);
+        if (pending.Length == 0) return;
+        ValidateStoredCount(pending, engine.ProtocolSettings.ValidatorsCount);
+
+        var previous = GetSequencerValidators(engine.SnapshotCache);
+        if (previous.Length == 0)
+            previous = engine.ProtocolSettings.StandbyValidators.OrderBy(static validator => validator).ToArray();
+        WriteSequencerValidators(engine.SnapshotCache, KeySequencerValidators, pending);
+        engine.SnapshotCache.Delete(CreateStorageKey(KeyPendingSequencerValidators));
+        Notify(engine, "SequencerCommitteeChanged", previous, pending);
+    }
+
+    internal bool TryGetNextSequencerValidators(IReadOnlyStore snapshot, int expectedCount, out ECPoint[] validators)
+    {
+        validators = [];
+        if (GetChainId(snapshot) == 0) return false;
+        validators = GetPendingSequencerValidators(snapshot);
+        if (validators.Length == 0)
+            validators = GetSequencerValidators(snapshot);
+        if (validators.Length == 0) return false;
+        ValidateStoredCount(validators, expectedCount);
+        return true;
+    }
+
+    private ECPoint[] ReadSequencerValidators(IReadOnlyStore snapshot, byte prefix)
+    {
+        if (!snapshot.TryGet(CreateStorageKey(prefix), out var item)) return [];
+        var encoded = item.Value.Span;
+        if (encoded.Length == 0
+            || encoded.Length % CompressedPublicKeyLength != 0
+            || encoded.Length > MaxSequencerValidators * CompressedPublicKeyLength)
+        {
+            throw new InvalidOperationException("Stored sequencer validator set is malformed.");
+        }
+
+        var validators = new ECPoint[encoded.Length / CompressedPublicKeyLength];
+        for (var index = 0; index < validators.Length; index++)
+        {
+            validators[index] = ECPoint.DecodePoint(
+                encoded.Slice(index * CompressedPublicKeyLength, CompressedPublicKeyLength),
+                ECCurve.Secp256r1);
+        }
+        if (validators.Distinct().Count() != validators.Length)
+            throw new InvalidOperationException("Stored sequencer validator set contains duplicate keys.");
+        if (!validators.SequenceEqual(validators.OrderBy(static validator => validator)))
+            throw new InvalidOperationException("Stored sequencer validator set is not canonically ordered.");
+        return validators;
+    }
+
+    private void WriteSequencerValidators(DataCache snapshot, byte prefix, ECPoint[] validators)
+    {
+        var encoded = new byte[validators.Length * CompressedPublicKeyLength];
+        for (var index = 0; index < validators.Length; index++)
+        {
+            validators[index].EncodePoint(true).CopyTo(encoded, index * CompressedPublicKeyLength);
+        }
+        snapshot.GetAndChange(CreateStorageKey(prefix), () => new StorageItem()).Value = encoded;
+    }
+
+    internal bool TryGetSequencerValidators(IReadOnlyStore snapshot, int expectedCount, out ECPoint[] validators)
+    {
+        validators = [];
+        if (GetChainId(snapshot) == 0) return false;
+        validators = GetSequencerValidators(snapshot);
+        if (validators.Length == 0) return false;
+        ValidateStoredCount(validators, expectedCount);
+        return true;
+    }
+
+    private static void ValidateStoredCount(ECPoint[] validators, int expectedCount)
+    {
+        if (validators.Length != expectedCount)
+            throw new InvalidOperationException(
+                $"Stored sequencer validator count {validators.Length} does not match protocol ValidatorsCount {expectedCount}.");
     }
 }
 
