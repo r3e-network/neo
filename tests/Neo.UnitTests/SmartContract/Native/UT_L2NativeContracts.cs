@@ -9,6 +9,7 @@
 // Redistribution and use in source and binary forms with or without
 // modifications are permitted.
 
+using Neo.Cryptography;
 using Neo.Cryptography.ECC;
 using Neo.Extensions.VM;
 using Neo.Network.P2P.Payloads;
@@ -19,6 +20,7 @@ using Neo.UnitTests.Extensions;
 using Neo.VM;
 using Neo.VM.Types;
 using Neo.Wallets;
+using System.Buffers.Binary;
 using System.Numerics;
 
 namespace Neo.UnitTests.SmartContract.Native;
@@ -387,10 +389,13 @@ public class UT_L2NativeContracts
         var l2User = UInt160.Parse("0x1414141414141414141414141414141414141414");
         var externalRecipient = UInt160.Parse("0x1515151515151515151515151515151515151515");
         var unregisteredForeignAsset = UInt160.Parse("0x1616161616161616161616161616161616161616");
+        var foreignSender = UInt160.Parse("0x1717171717171717171717171717171717171717");
+        var sourceTransaction = UInt256.Parse("0x1818181818181818181818181818181818181818181818181818181818181818");
         const uint bscMainnet = 0xe0000038;
+        const uint neoChainId = 1099;
 
         NativeContract.L2NativeExternalBridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
-            "configure", Hash160(owner), Hash160(systemAccount));
+            "configure", Hash160(owner), Hash160(systemAccount), Integer(neoChainId));
         NativeContract.BridgedNep17.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(committee), block,
             "configure", Hash160(owner), Hash160(NativeContract.L2Bridge.Hash));
         NativeContract.BridgedNep17.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
@@ -403,17 +408,50 @@ public class UT_L2NativeContracts
             "createBridgedToken", Text("BSC DAI"), Text("BDAI"), Integer(18), Hash160(unregisteredForeignAsset), Integer(1_000_000))!;
         var unregisteredL2Asset = new UInt160(unregisteredAsset.GetSpan());
 
-        Assert.ThrowsExactly<InvalidOperationException>(() =>
-            NativeContract.L2NativeExternalBridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(systemAccount), block,
-                "applyInbound", Integer(bscMainnet), Integer(1), Hash160(foreignAsset), Hash160(l2User), Hash160(unregisteredL2Asset), Integer(1)));
-
         NativeContract.L2NativeExternalBridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(owner), block,
             "registerAssetMapping", Integer(bscMainnet), Hash160(foreignAsset), Hash160(l2Asset));
         Assert.IsTrue(NativeContract.L2NativeExternalBridge.IsL2AssetRegistered(snapshot, bscMainnet, l2Asset));
-        NativeContract.L2NativeExternalBridge.Call(snapshot, new Nep17NativeContractExtensions.ManualWitness(systemAccount), block,
-            "applyInbound", Integer(bscMainnet), Integer(1), Hash160(foreignAsset), Hash160(l2User), Hash160(l2Asset), Integer(250));
+
+        var messageBytes = ExternalPayoutMessage(
+            bscMainnet, neoChainId, 1, foreignSender, foreignAsset, l2User, 250,
+            sourceTransaction);
+        var messageHash = new UInt256(Crypto.Hash256(messageBytes));
+        var payoutTransaction = PayoutTransaction(systemAccount, 1);
+        var strangerTransaction = PayoutTransaction(l2User, 2);
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2NativeExternalBridge.Call(snapshot, strangerTransaction, block,
+                "applyPayout", Integer(bscMainnet), Integer(neoChainId), Integer(1),
+                Hash160(foreignAsset), Hash160(l2Asset), Hash160(l2User), Integer(250),
+                Integer(0), Hash256(sourceTransaction), Hash256(messageHash), ByteArray(messageBytes)));
+        Assert.ThrowsExactly<InvalidDataException>(() =>
+            NativeContract.L2NativeExternalBridge.Call(snapshot, payoutTransaction, block,
+                "applyPayout", Integer(bscMainnet), Integer(neoChainId), Integer(1),
+                Hash160(foreignAsset), Hash160(l2Asset), Hash160(l2User), Integer(251),
+                Integer(0), Hash256(sourceTransaction), Hash256(messageHash), ByteArray(messageBytes)));
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2NativeExternalBridge.Call(snapshot, payoutTransaction, block,
+                "applyPayout", Integer(bscMainnet), Integer(neoChainId), Integer(1),
+                Hash160(foreignAsset), Hash160(unregisteredL2Asset), Hash160(l2User), Integer(250),
+                Integer(0), Hash256(sourceTransaction), Hash256(messageHash), ByteArray(messageBytes)));
+
+        NativeContract.L2NativeExternalBridge.Call(snapshot, payoutTransaction, block,
+            "applyPayout", Integer(bscMainnet), Integer(neoChainId), Integer(1),
+            Hash160(foreignAsset), Hash160(l2Asset), Hash160(l2User), Integer(250),
+            Integer(0), Hash256(sourceTransaction), Hash256(messageHash), ByteArray(messageBytes));
 
         Assert.AreEqual(250, BalanceOf(snapshot, l2Asset, l2User));
+        Assert.AreEqual(messageHash,
+            NativeContract.L2NativeExternalBridge.GetInboundMessageHash(snapshot, bscMainnet, 1));
+        Assert.AreEqual(payoutTransaction.Hash,
+            NativeContract.L2NativeExternalBridge.GetInboundTransactionHash(snapshot, bscMainnet, 1));
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            NativeContract.L2NativeExternalBridge.Call(snapshot, payoutTransaction, block,
+                "applyPayout", Integer(bscMainnet), Integer(neoChainId), Integer(1),
+                Hash160(foreignAsset), Hash160(l2Asset), Hash160(l2User), Integer(250),
+                Integer(0), Hash256(sourceTransaction), Hash256(messageHash), ByteArray(messageBytes)));
+        Assert.AreEqual(250, BalanceOf(snapshot, l2Asset, l2User),
+            "replay must not credit the recipient twice");
 
         CallAsScript(NativeContract.L2NativeExternalBridge, snapshot, l2User, new Nep17NativeContractExtensions.ManualWitness(l2User), block,
             "send", Integer(bscMainnet), Hash160(externalRecipient), Hash160(l2Asset), Integer(75), ByteArray([]), Integer(0));
@@ -426,6 +464,11 @@ public class UT_L2NativeContracts
     private static ContractParameter Hash160(UInt160 value)
     {
         return new ContractParameter(ContractParameterType.Hash160) { Value = value };
+    }
+
+    private static ContractParameter Hash256(UInt256 value)
+    {
+        return new ContractParameter(ContractParameterType.Hash256) { Value = value };
     }
 
     private static ContractParameter Integer(BigInteger value)
@@ -459,6 +502,51 @@ public class UT_L2NativeContracts
     private static ContractParameter Boolean(bool value)
     {
         return new ContractParameter(ContractParameterType.Boolean) { Value = value };
+    }
+
+    private static byte[] ExternalPayoutMessage(
+        uint externalChainId,
+        uint neoChainId,
+        ulong nonce,
+        UInt160 foreignSender,
+        UInt160 foreignAsset,
+        UInt160 recipient,
+        BigInteger amount,
+        UInt256 sourceTransaction)
+    {
+        var amountBytes = amount.ToByteArray(isUnsigned: true, isBigEndian: false);
+        var payloadLength = 24 + amountBytes.Length;
+        var bytes = new byte[102 + payloadLength];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0, 4), externalChainId);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(4, 4), neoChainId);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(8, 8), nonce);
+        bytes[16] = 2;
+        foreignSender.GetSpan().CopyTo(bytes.AsSpan(17, UInt160.Length));
+        recipient.GetSpan().CopyTo(bytes.AsSpan(37, UInt160.Length));
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(57, 8), 0);
+        sourceTransaction.GetSpan().CopyTo(bytes.AsSpan(65, UInt256.Length));
+        bytes[97] = 0;
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(98, 4), (uint)payloadLength);
+        foreignAsset.GetSpan().CopyTo(bytes.AsSpan(102, UInt160.Length));
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(122, 4), (uint)amountBytes.Length);
+        amountBytes.CopyTo(bytes, 126);
+        return bytes;
+    }
+
+    private static Transaction PayoutTransaction(UInt160 signer, uint nonce)
+    {
+        return new Transaction
+        {
+            Version = 0,
+            Nonce = nonce,
+            SystemFee = 0,
+            NetworkFee = 0,
+            ValidUntilBlock = 100,
+            Signers = [new Signer { Account = signer, Scopes = WitnessScope.Global }],
+            Attributes = [],
+            Script = new byte[] { (byte)OpCode.RET },
+            Witnesses = [Witness.Empty],
+        };
     }
 
     private static BigInteger BalanceOf(DataCache snapshot, UInt160 assetId, UInt160 account)

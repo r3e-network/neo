@@ -15,6 +15,7 @@ using Neo.Cryptography;
 using Neo.Cryptography.ECC;
 using Neo.Extensions;
 using Neo.Extensions.IO;
+using Neo.Network.P2P.Payloads;
 using Neo.Persistence;
 using Neo.SmartContract.Manifest;
 using Neo.VM.Types;
@@ -843,26 +844,34 @@ public sealed class L2PaymasterContract : L2NativeContract
 }
 
 [ContractEvent(0, name: "ExternalSendInitiated", "externalChainId", ContractParameterType.Integer, "nonce", ContractParameterType.Integer, "sender", ContractParameterType.Hash160, "recipient", ContractParameterType.Hash160, "l2Asset", ContractParameterType.Hash160, "amount", ContractParameterType.Integer, "calldata", ContractParameterType.ByteArray)]
-[ContractEvent(1, name: "ExternalInboundApplied", "externalChainId", ContractParameterType.Integer, "nonce", ContractParameterType.Integer, "foreignSender", ContractParameterType.Hash160, "l2Recipient", ContractParameterType.Hash160, "amount", ContractParameterType.Integer)]
+[ContractEvent(1, name: "ExternalInboundApplied", "externalChainId", ContractParameterType.Integer, "nonce", ContractParameterType.Integer, "l2Recipient", ContractParameterType.Hash160, "l2Asset", ContractParameterType.Hash160, "amount", ContractParameterType.Integer, "messageHash", ContractParameterType.Hash256, "l2TransactionHash", ContractParameterType.Hash256)]
 public sealed class L2NativeExternalBridgeContract : L2NativeContract
 {
+    private const int FixedMessagePrefixSize = 102;
+    private const int MaxPayloadLength = 64 * 1024;
+    private const int MaxAmountBytes = 32;
+    private const byte DirectionForeignToNeo = 2;
+    private const byte MessageTypeAssetTransfer = 0;
     private const byte PrefixOutboundNonce = 0x01;
     private const byte PrefixConsumedInboundNonce = 0x02;
     private const byte PrefixAssetMapping = 0x03;
     private const byte PrefixReverseAssetMapping = 0x04;
+    private const byte KeyChainId = 0xfd;
     private const byte KeySystemAccount = 0xfe;
     private const byte KeyOwner = 0xff;
 
     internal L2NativeExternalBridgeContract() : base(-107) { }
 
     [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States)]
-    private void Configure(ApplicationEngine engine, UInt160 owner, UInt160 systemAccount)
+    private void Configure(ApplicationEngine engine, UInt160 owner, UInt160 systemAccount, uint chainId)
     {
         AssertOwnerOrCommittee(engine, KeyOwner);
         RequireNonZero(owner, nameof(owner));
         RequireNonZero(systemAccount, nameof(systemAccount));
+        if (chainId == 0) throw new ArgumentOutOfRangeException(nameof(chainId), "chainId must be non-zero.");
         WriteUInt160(engine.SnapshotCache, KeyOwner, owner);
         WriteUInt160(engine.SnapshotCache, KeySystemAccount, systemAccount);
+        WriteInteger(engine.SnapshotCache, KeyChainId, chainId);
     }
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
@@ -870,6 +879,9 @@ public sealed class L2NativeExternalBridgeContract : L2NativeContract
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
     public UInt160 GetSystemAccount(IReadOnlyStore snapshot) => ReadUInt160(snapshot, KeySystemAccount);
+
+    [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
+    public uint GetChainId(IReadOnlyStore snapshot) => (uint)ReadInteger(snapshot, KeyChainId);
 
     [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States)]
     private void RegisterAssetMapping(ApplicationEngine engine, uint externalChainId, UInt160 foreignAsset, UInt160 l2Asset)
@@ -911,18 +923,47 @@ public sealed class L2NativeExternalBridgeContract : L2NativeContract
     }
 
     [ContractMethod(CpuFee = 1 << 15, StorageFee = 1 << 7, RequiredCallFlags = CallFlags.States | CallFlags.AllowNotify)]
-    private async ContractTask ApplyInbound(ApplicationEngine engine, uint externalChainId, ulong nonce, UInt160 foreignSender, UInt160 l2Recipient, UInt160 l2Asset, BigInteger amount)
+    private async ContractTask ApplyPayout(
+        ApplicationEngine engine,
+        uint externalChainId,
+        uint neoChainId,
+        ulong nonce,
+        UInt160 foreignAsset,
+        UInt160 l2Asset,
+        UInt160 l2Recipient,
+        BigInteger amount,
+        ulong deadlineUnixSeconds,
+        UInt256 sourceTxRef,
+        UInt256 messageHash,
+        byte[] messageBytes)
     {
         AssertSystem(engine, KeySystemAccount);
+        if (neoChainId == 0 || neoChainId != GetChainId(engine.SnapshotCache))
+            throw new InvalidOperationException("payout targets another Neo L2 chain");
+        if (!IsForeignChainId(externalChainId))
+            throw new ArgumentOutOfRangeException(nameof(externalChainId), "externalChainId must use 0xE0 namespace.");
+        RequireNonZero(foreignAsset, nameof(foreignAsset));
         RequirePositive(amount, nameof(amount));
         RequireNonZero(l2Recipient, nameof(l2Recipient));
         RequireNonZero(l2Asset, nameof(l2Asset));
-        if (!IsL2AssetRegistered(engine.SnapshotCache, externalChainId, l2Asset)) throw new InvalidOperationException("asset not registered for external chain");
+        if (sourceTxRef == UInt256.Zero) throw new ArgumentException("sourceTxRef must be non-zero.", nameof(sourceTxRef));
+        if (messageHash == UInt256.Zero) throw new ArgumentException("messageHash must be non-zero.", nameof(messageHash));
+        ValidateCanonicalPayout(
+            externalChainId, neoChainId, nonce, foreignAsset, l2Recipient, amount,
+            deadlineUnixSeconds, sourceTxRef, messageHash, messageBytes);
+        if (GetAssetMapping(engine.SnapshotCache, externalChainId, foreignAsset) != l2Asset)
+            throw new InvalidOperationException("mapped L2 asset does not match native asset registry");
         var consumed = Key(PrefixConsumedInboundNonce, externalChainId, nonce);
         if (engine.SnapshotCache.Contains(consumed)) throw new InvalidOperationException("inbound nonce already consumed");
-        engine.SnapshotCache.Add(consumed, new StorageItem(new byte[] { 1 }));
+        if (engine.ScriptContainer is not Transaction transaction)
+            throw new InvalidOperationException("external payout requires a transaction context");
+        var receipt = new byte[UInt256.Length * 2];
+        messageHash.GetSpan().CopyTo(receipt.AsSpan(0, UInt256.Length));
+        transaction.Hash.GetSpan().CopyTo(receipt.AsSpan(UInt256.Length, UInt256.Length));
+        engine.SnapshotCache.Add(consumed, new StorageItem(receipt));
         await engine.CallFromNativeContractAsync(Hash, NativeContract.BridgedNep17.Hash, "mint", l2Asset, l2Recipient, amount);
-        Notify(engine, "ExternalInboundApplied", externalChainId, nonce, foreignSender, l2Recipient, amount);
+        Notify(engine, "ExternalInboundApplied", externalChainId, nonce, l2Recipient,
+            l2Asset, amount, messageHash, transaction.Hash);
     }
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
@@ -930,6 +971,90 @@ public sealed class L2NativeExternalBridgeContract : L2NativeContract
 
     [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
     public bool IsInboundConsumed(IReadOnlyStore snapshot, uint externalChainId, ulong nonce) => snapshot.Contains(Key(PrefixConsumedInboundNonce, externalChainId, nonce));
+
+    [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
+    public UInt256 GetInboundMessageHash(IReadOnlyStore snapshot, uint externalChainId, ulong nonce)
+    {
+        return ReadInboundReceiptHash(snapshot, externalChainId, nonce, 0);
+    }
+
+    [ContractMethod(CpuFee = 1 << 15, RequiredCallFlags = CallFlags.ReadStates)]
+    public UInt256 GetInboundTransactionHash(IReadOnlyStore snapshot, uint externalChainId, ulong nonce)
+    {
+        return ReadInboundReceiptHash(snapshot, externalChainId, nonce, UInt256.Length);
+    }
+
+    private static UInt160 ValidateCanonicalPayout(
+        uint externalChainId,
+        uint neoChainId,
+        ulong nonce,
+        UInt160 foreignAsset,
+        UInt160 recipient,
+        BigInteger amount,
+        ulong deadlineUnixSeconds,
+        UInt256 sourceTxRef,
+        UInt256 messageHash,
+        byte[] messageBytes)
+    {
+        if (messageBytes.Length < FixedMessagePrefixSize + 25)
+            throw new InvalidDataException("canonical external payout is truncated");
+        if (ReadU32Le(messageBytes.AsSpan(0, 4)) != externalChainId)
+            throw new InvalidDataException("signed external chain mismatch");
+        if (ReadU32Le(messageBytes.AsSpan(4, 4)) != neoChainId)
+            throw new InvalidDataException("signed Neo chain mismatch");
+        if (ReadU64Le(messageBytes.AsSpan(8, 8)) != nonce)
+            throw new InvalidDataException("signed nonce mismatch");
+        if (messageBytes[16] != DirectionForeignToNeo)
+            throw new InvalidDataException("signed direction must be foreign-to-Neo");
+        var foreignSender = new UInt160(messageBytes.AsSpan(17, UInt160.Length));
+        RequireNonZero(foreignSender, nameof(foreignSender));
+        if (new UInt160(messageBytes.AsSpan(37, UInt160.Length)) != recipient)
+            throw new InvalidDataException("signed recipient mismatch");
+        if (ReadU64Le(messageBytes.AsSpan(57, 8)) != deadlineUnixSeconds)
+            throw new InvalidDataException("signed deadline mismatch");
+        if (new UInt256(messageBytes.AsSpan(65, UInt256.Length)) != sourceTxRef)
+            throw new InvalidDataException("signed source transaction mismatch");
+        if (messageBytes[97] != MessageTypeAssetTransfer)
+            throw new InvalidDataException("native payout supports asset-transfer messages only");
+        var payloadLength = ReadU32Le(messageBytes.AsSpan(98, 4));
+        if (payloadLength > MaxPayloadLength
+            || messageBytes.Length != FixedMessagePrefixSize + payloadLength)
+            throw new InvalidDataException("canonical payout payload length mismatch");
+        if (new UInt160(messageBytes.AsSpan(102, UInt160.Length)) != foreignAsset)
+            throw new InvalidDataException("signed foreign asset mismatch");
+        var amountLength = ReadU32Le(messageBytes.AsSpan(122, 4));
+        if (amountLength is 0 or > MaxAmountBytes || payloadLength != 24 + amountLength)
+            throw new InvalidDataException("signed amount length mismatch");
+        var amountBytes = messageBytes.AsSpan(126, checked((int)amountLength));
+        if (amountBytes[^1] == 0)
+            throw new InvalidDataException("signed amount is not minimally encoded");
+        var signedAmount = new BigInteger(amountBytes, isUnsigned: true, isBigEndian: false);
+        if (signedAmount != amount) throw new InvalidDataException("signed amount mismatch");
+        if (!Crypto.Hash256(messageBytes).AsSpan().SequenceEqual(messageHash.GetSpan()))
+            throw new InvalidDataException("canonical message hash mismatch");
+        return foreignSender;
+    }
+
+    private UInt256 ReadInboundReceiptHash(
+        IReadOnlyStore snapshot,
+        uint externalChainId,
+        ulong nonce,
+        int offset)
+    {
+        if (!snapshot.TryGet(Key(PrefixConsumedInboundNonce, externalChainId, nonce), out var item))
+            return UInt256.Zero;
+        if (item.Value.Length != UInt256.Length * 2)
+            throw new InvalidDataException("external payout receipt storage is corrupt");
+        return new UInt256(item.Value.Span.Slice(offset, UInt256.Length));
+    }
+
+    private static uint ReadU32Le(ReadOnlySpan<byte> bytes)
+    {
+        return (uint)bytes[0]
+            | ((uint)bytes[1] << 8)
+            | ((uint)bytes[2] << 16)
+            | ((uint)bytes[3] << 24);
+    }
 }
 
 [ContractEvent(0, name: "AccountConfigured", "account", ContractParameterType.Hash160, "validator", ContractParameterType.Hash160, "paymaster", ContractParameterType.Hash160)]
